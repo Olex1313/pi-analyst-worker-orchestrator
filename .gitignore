@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.DS_Store
+
+# Local run logs and large artifacts
+tmp/
+
+# Optional file-based workflow runtime data
+ai/token_usage.jsonl
+ai/token_usage_seen.json
+ai/token_usage_summary.json
+ai/tmp/
+
+# Pi/project local caches that should not be published unless explicitly intended
+.pi/session*/
+.pi/sessions*/

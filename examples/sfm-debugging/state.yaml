@@ -1,0 +1,31 @@
+task_id: sfm_debugging_example
+
+analyst_model: "frontier-reasoner-high"
+worker_model: "fast-coder-high"
+
+context_token_limit: 200000
+compaction_soft_limit: 170000
+
+state: NEEDS_WORKER
+current_actor: analyst
+next_actor: worker
+
+global_goal_done: false
+needs_operator_input: false
+needs_compaction: false
+
+operator_goal: "Find and fix a structure-from-motion regression without overfitting to one scene."
+current_focus: "Reproduce the bundle-adjustment divergence on the smallest failing fixture."
+forbidden_focus:
+  - "Do not run full dataset sweeps until a minimal repro is validated."
+
+confirmed_facts:
+  - "The regression appeared after the robust loss refactor."
+rejected_hypotheses: []
+active_hypotheses:
+  - "Scale normalization changed residual weighting."
+
+last_commit: ""
+last_prompt_record: ""
+tmp_dir: "./tmp"
+artifact_dir: "./tmp/sfm_debugging_example"

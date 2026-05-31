@@ -1,0 +1,28 @@
+task_id: example_task
+
+analyst_model: "chatgpt-5.5-high"
+worker_model: "deepseek-v4-flash-high"
+
+context_token_limit: 200000
+compaction_soft_limit: 170000
+
+state: OPERATOR_TASK
+current_actor: operator
+next_actor: analyst
+
+global_goal_done: false
+needs_operator_input: false
+needs_compaction: false
+
+operator_goal: ""
+current_focus: ""
+forbidden_focus: []
+
+confirmed_facts: []
+rejected_hypotheses: []
+active_hypotheses: []
+
+last_commit: ""
+last_prompt_record: ""
+tmp_dir: "./tmp"
+artifact_dir: "./tmp/agent_orchestrator"
