@@ -1,3 +1,5 @@
+<img width="239" alt="Analyst and worker orchestration" src="https://github.com/user-attachments/assets/30f359cc-7e57-47b5-b9a1-aa9605ca1e4e" />
+
 # pi-analyst-worker-orchestrator
 
 Plan with a strong model. Execute with a cheaper model. Track tokens per role.
