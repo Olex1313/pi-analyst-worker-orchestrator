@@ -1,10 +1,14 @@
-# Pi Analyst/Worker Orchestrator
+# pi-analyst-worker-orchestrator
 
-Token-aware analyst/worker workflow and token ledger extension for Pi Dev coding agents.
+Plan with a strong model. Execute with a cheaper model. Track tokens per role.
 
-**Plan with a frontier model. Execute with a cheaper/fast model. Track tokens per role. Keep long coding sessions reproducible.**
+`pi-analyst-worker-orchestrator` is a Pi Dev package for long coding-agent sessions. It provides an analyst/worker workflow, file-based handoff protocol, compaction gate, token/cost ledger, and per-step timing ledger.
 
-This project does not depend on specific model providers. ChatGPT/GPT-5.5 High and DeepSeek V4 Flash High are examples of a strong analyst model and a fast worker model. Use any models that fit your cost, latency, and quality requirements.
+Use a stronger frontier model such as ChatGPT/GPT-5.5 High as the **Analyst** for planning, diagnosis, and review. Use a faster/cheaper model such as DeepSeek V4 Flash High as the **Worker** for code edits, repository search, builds, benchmarks, and experiments.
+
+The goal is to reduce token cost and context bloat while keeping long debugging sessions reproducible.
+
+This project does not depend on specific model providers. ChatGPT/GPT-5.5 High and DeepSeek V4 Flash High are examples, not requirements. Use any models that fit your cost, latency, and quality requirements.
 
 ## Big example: expensive Analyst, fast Worker
 
@@ -73,16 +77,28 @@ Pi Analyst/Worker Orchestrator provides a file-based workflow protocol plus a Pi
 
 ## Installation
 
+From npm, after publication:
+
+```bash
+pi install npm:pi-analyst-worker-orchestrator
+```
+
 From GitHub:
 
 ```bash
-pi install git@github.com:UnicornGlade/pi-analyst-worker-orchestrator.git
+pi install git:github.com/UnicornGlade/pi-analyst-worker-orchestrator
 ```
 
-After the package is published to npm, it can be installed by package name:
+Pinned to a release tag:
 
 ```bash
-pi install pi-analyst-worker-orchestrator
+pi install git:github.com/UnicornGlade/pi-analyst-worker-orchestrator@v0.1.1
+```
+
+Try without installing:
+
+```bash
+pi -e git:github.com/UnicornGlade/pi-analyst-worker-orchestrator
 ```
 
 For local development from this checkout:
@@ -242,6 +258,19 @@ The chat is an interface. The source of truth should be repository state, git hi
 
 Token/cost files can contain provider names, internal task IDs, and cost data; they are ignored by default in `.gitignore`.
 
+## What this helps with
+
+- Pi Dev multi-agent workflows
+- analyst / worker coding-agent loops
+- token cost optimization
+- per-role token tracking
+- context compaction
+- long-running debugging sessions
+- cheaper code execution model with stronger planning model
+- reproducible AI coding workflows
+- GPU/kernel optimization experiments
+- large refactors with repeated validation
+
 ## Commands
 
 ```text
@@ -256,6 +285,12 @@ Token/cost files can contain provider names, internal task IDs, and cost data; t
 /analyst-worker abort
 ```
 
+## Security
+
+Pi packages can execute code and influence agent behavior. Review the source before installing third-party packages.
+
+This package writes local workflow and token accounting files under `./tmp/`, `.pi/analyst-worker.json`, and optional template files under `./ai/`. It does not upload token logs anywhere.
+
 ## Notes on OpenAI Codex / ChatGPT models
 
 For `openai-codex/*` Analyst models, Analyst turns run through a short child `pi` process with proxy environment enabled. Worker turns remain in the main Pi session with tools. The extension restores the prior/safe interactive model and thinking level on operator handoff so normal follow-up prompts keep using the regular Pi transport.
@@ -267,6 +302,8 @@ pi-analyst-worker-orchestrator/
   README.md
   LICENSE
   package.json
+  extensions/
+    index.ts
   src/
     index.ts
   prompts/

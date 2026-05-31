@@ -1,17 +1,18 @@
 {
   "name": "pi-analyst-worker-orchestrator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Token-aware analyst/worker workflow and token ledger extension for Pi Dev coding agents.",
   "type": "module",
   "license": "MIT",
   "keywords": [
-    "pi-dev",
     "pi-package",
+    "pi-dev",
     "pi-extension",
     "coding-agent",
     "ai-agent",
     "agent-orchestration",
     "token-tracking",
+    "token-ledger",
     "llm-workflow",
     "multi-agent",
     "developer-tools",
@@ -22,13 +23,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/UnicornGlade/pi-analyst-worker-orchestrator.git"
+    "url": "git+https://github.com/UnicornGlade/pi-analyst-worker-orchestrator.git"
   },
   "bugs": {
     "url": "https://github.com/UnicornGlade/pi-analyst-worker-orchestrator/issues"
   },
   "homepage": "https://github.com/UnicornGlade/pi-analyst-worker-orchestrator#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
+    "extensions",
     "src",
     "skills",
     "prompts",
@@ -41,7 +46,7 @@
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./extensions/index.ts"
     ]
   },
   "peerDependencies": {

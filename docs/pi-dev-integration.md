@@ -5,7 +5,7 @@ The package is a Pi extension registered through `package.json`:
 ```json
 {
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./extensions/index.ts"]
   }
 }
 ```
