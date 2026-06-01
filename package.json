@@ -1,6 +1,6 @@
 {
   "name": "pi-analyst-worker-orchestrator",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Token-aware analyst/worker workflow and token ledger extension for Pi Dev coding agents.",
   "type": "module",
   "license": "MIT",
