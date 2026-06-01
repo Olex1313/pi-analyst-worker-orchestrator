@@ -7,8 +7,7 @@ import type {
 	MessageUpdateEvent,
 	ToolCallEvent,
 } from "@mariozechner/pi-coding-agent";
-import { getMarkdownTheme } from "@mariozechner/pi-coding-agent";
-import { Key, Markdown, matchesKey, Text, truncateToWidth } from "@mariozechner/pi-tui";
+import { Key, matchesKey, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1924,7 +1923,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			/\bfailed an availability probe\b|\bCompaction failed\b|\bError:/i.test(text) ||
 			/\bState:\s*(BLOCKED_NEEDS_OPERATOR|ABORTED)\b/i.test(text);
 		if (isError) return new Text(theme.fg("error", text), 0, 0);
-		return new Markdown(text, 0, 0, getMarkdownTheme());
+		return undefined;
 	});
 
 	pi.on("session_start", (_event, ctx) => {
