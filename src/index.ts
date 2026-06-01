@@ -14,10 +14,6 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
-// Keep direct in-process provider calls aligned with the terminal/Pi-dev proxy
-// environment. External Analyst subprocesses also pass this explicitly.
-process.env.NODE_USE_ENV_PROXY ??= "1";
-
 const CUSTOM_MESSAGE = "pi-analyst-worker";
 const STATE_ENTRY = "pi-analyst-worker-state";
 const EXTENSION_VERSION = 1;
@@ -1932,12 +1928,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		process.env.NODE_USE_ENV_PROXY ??= "1";
 		restore(ctx);
-	});
-
-	pi.on("before_provider_request", () => {
-		process.env.NODE_USE_ENV_PROXY ??= "1";
 	});
 
 	pi.on("before_agent_start", (event) => {
