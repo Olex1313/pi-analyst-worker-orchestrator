@@ -24,6 +24,14 @@ If no worker work is needed, write `None`.
 - Benchmark reliability concerns:
 - Unexpected diffs/errors:
 
+## Operational memory
+
+- Worker issues/risks/lessons carried forward:
+- Failed commands/errors:
+- Major delays/slow steps:
+- Environment or benchmark caveats:
+- Recommendations for future runs:
+
 ## Next state
 
 Choose one:

@@ -40,6 +40,9 @@ Tests/checks/logs and their results.
 ## Diff / artifacts
 Relevant file paths, temp logs, and generated artifacts.
 
+## Issues / risks / lessons
+Always list failed commands, retries, surprising results, benchmark noise/variance, environment caveats, slow operations, and anything the analyst should remember. Write `None` only if genuinely none.
+
 ## Worker recommendation / next steps
 Suggest what you think the next stage should be, based on what you just observed. The analyst will make the final decision.
 

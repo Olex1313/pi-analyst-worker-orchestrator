@@ -26,6 +26,14 @@ Summarize what changed or what was learned.
 - Generated files:
 - Relevant diff:
 
+## Issues / risks / lessons
+
+- Failed commands/retries:
+- Surprising results:
+- Benchmark/environment caveats:
+- Slow operations:
+- Lessons for analyst/future runs:
+
 ## Worker recommendation / next steps
 
 Suggest what the analyst should consider next. The analyst makes the final decision.

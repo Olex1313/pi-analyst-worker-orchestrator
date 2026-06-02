@@ -24,5 +24,6 @@ Required output:
 ## Result
 ## Validation
 ## Diff / artifacts
+## Issues / risks / lessons
 ## Worker recommendation / next steps
 ## Stop / handoff

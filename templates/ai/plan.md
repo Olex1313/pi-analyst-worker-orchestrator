@@ -39,4 +39,5 @@ The worker should report:
 - commands run;
 - validation result;
 - raw artifact paths;
+- issues/risks/lessons encountered;
 - concise suggested next steps for analyst review.

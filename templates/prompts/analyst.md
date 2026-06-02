@@ -24,5 +24,6 @@ Required output:
 ## Hypothesis
 ## Worker instruction
 ## Validation / Risks
+## Operational memory
 ## Next state
 ## Operator handoff

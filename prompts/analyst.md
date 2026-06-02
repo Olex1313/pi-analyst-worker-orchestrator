@@ -43,6 +43,9 @@ If no worker work is needed, write `None`.
 ## Validation / Risks
 What was validated and remaining risks.
 
+## Operational memory
+Carry forward known failed commands, benchmark caveats, environment constraints, suspicious results, slow steps, and lessons from previous Worker reports.
+
 ## Next state
 One of:
 - NEEDS_WORKER

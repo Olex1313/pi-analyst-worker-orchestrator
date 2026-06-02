@@ -16,7 +16,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 const CUSTOM_MESSAGE = "pi-analyst-worker";
 const STATE_ENTRY = "pi-analyst-worker-state";
 const EXTENSION_VERSION = 1;
-const MAX_AUTONOMOUS_WORKER_STEPS = 25;
+const DEFAULT_MAX_AUTONOMOUS_HOURS = 24;
 
 type Role = "ANALYST" | "WORKER";
 type Phase = "ANALYST_PLAN" | "WORKER_RUN" | "ANALYST_REVIEW";
@@ -54,6 +54,7 @@ interface AwConfig {
 	workerContextLimitTokens: number;
 	toolPolicy: ToolPolicy;
 	maxWorkerStepsBeforeOperator: number;
+	maxAutonomousHours: number;
 	artifactDir: string;
 	artifactPolicy: ArtifactPolicy;
 	startedAt: string;
@@ -79,6 +80,7 @@ interface AwRun {
 	operatorModel?: string;
 	operatorThinkingLevel?: ThinkingLevel;
 	workerStepsSinceOperator: number;
+	autonomousStartedAt?: string;
 	updatedAt: string;
 }
 
@@ -92,6 +94,7 @@ interface ActiveTurn {
 	startedAt: string;
 	auto: boolean;
 	toolMs: number;
+	toolMsByName: Record<string, number>;
 	toolCounts: Record<string, number>;
 	toolErrors: number;
 	externalMs: number;
@@ -110,6 +113,7 @@ interface StepTiming {
 	llm_ms: number;
 	tool_ms: number;
 	external_ms: number;
+	tool_ms_by_name?: Record<string, number>;
 	tool_counts: Record<string, number>;
 	tool_errors: number;
 }
@@ -163,6 +167,7 @@ interface AwPreferences {
 	workerContextLimitTokens: number;
 	toolPolicy: ToolPolicy;
 	maxWorkerStepsBeforeOperator: number;
+	maxAutonomousHours?: number;
 	artifactPolicy: ArtifactPolicy;
 	updatedAt: string;
 }
@@ -176,6 +181,7 @@ interface WorkflowSettings {
 	workerContextLimitTokens: number;
 	toolPolicy: ToolPolicy;
 	maxWorkerStepsBeforeOperator: number;
+	maxAutonomousHours: number;
 	artifactPolicy: ArtifactPolicy;
 }
 
@@ -193,7 +199,8 @@ Hard requirements:
 - Do not perform worker implementation unless explicitly instructed by the operator.
 - Stop and ask the operator if results are contradictory, invalid, risky, out of scope, context/cost constrained, require credentials/network, or require a human trade-off.
 - Let the workflow continue automatically with the worker while the next state is NEEDS_WORKER.
-- In final or operator-facing reviews, include token/time totals, major delays, important errors, and lessons to make future runs faster/better.`;
+- In every review, read the worker's issues/risks/lessons and carry them forward.
+- In final or operator-facing reviews, include a concrete operational reflection: token/time totals, major delays, failed commands/errors, benchmark reliability concerns, and lessons to make future runs faster/better.`;
 
 const WORKER_SYSTEM = `You are the WORKER in a Pi Analyst/Worker workflow.
 
@@ -204,7 +211,8 @@ Hard requirements:
 - Do not continue into a second task.
 - Do not silently broaden scope.
 - Keep scratch logs under the configured artifact directory.
-- Stop on unexpected results, missing credentials/network/tool capability, unclear requirements, or out-of-scope diffs.`;
+- Stop on unexpected results, missing credentials/network/tool capability, unclear requirements, or out-of-scope diffs.
+- Always report operational friction: failed commands, retries, suspicious outputs, benchmark variance, slow steps, environment/GPU/load caveats, and lessons for the analyst to carry forward.`;
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -485,6 +493,16 @@ function asNumber(input: string | undefined, fallback: number): number {
 	return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function asPositiveNumber(input: unknown, fallback: number): number {
+	const n = typeof input === "number" ? input : Number(String(input ?? "").trim().replace(",", "."));
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function formatHours(hours: number): string {
+	if (!Number.isFinite(hours) || hours <= 0) return `${DEFAULT_MAX_AUTONOMOUS_HOURS}h`;
+	return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")}h`;
+}
+
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
 	return typeof value === "string" && (THINKING_LEVELS as string[]).includes(value);
 }
@@ -632,6 +650,21 @@ function formatMoney(n: number): string {
 	return n > 0 ? `$${n.toFixed(6)}` : "$0";
 }
 
+function formatMoneyShort(n: number): string {
+	if (!Number.isFinite(n) || n <= 0) return "–";
+	if (n >= 1) return `$${n.toFixed(2)}`;
+	if (n >= 0.1) return `$${n.toFixed(3)}`;
+	if (n >= 0.01) return `$${n.toFixed(4)}`;
+	return `$${n.toFixed(5)}`;
+}
+
+function formatTokenCount(n: number): string {
+	if (!Number.isFinite(n) || n <= 0) return "–";
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 10_000) return `${Math.round(n / 1_000)}K`;
+	return Math.round(n).toLocaleString("en-US");
+}
+
 function formatUsage(usage: UsageTotals): string {
 	return `IN ${usage.in}, OUT ${usage.out}, cache read ${usage.cache_read}, cache write ${usage.cache_write}, cost ${formatMoney(usage.cost)}`;
 }
@@ -679,35 +712,170 @@ async function appendCompaction(run: AwRun, compaction: LedgerCompaction): Promi
 	await writeLedger(run, ledger);
 }
 
+function makeTextTable(rows: string[][], align: ("left" | "right")[] = []): string {
+	const widths = rows[0]?.map((_, col) => Math.max(...rows.map((row) => row[col]?.length ?? 0))) ?? [];
+	return rows
+		.map((row) => row.map((cell, col) => (align[col] === "right" ? cell.padStart(widths[col]) : cell.padEnd(widths[col]))).join("  ").trimEnd())
+		.join("\n");
+}
+
+function formatRole(role: Role | "TOTAL" | "UNKNOWN"): string {
+	if (role === "ANALYST") return "Analyst";
+	if (role === "WORKER") return "Worker";
+	if (role === "TOTAL") return "Total";
+	return "Other";
+}
+
+function formatLedgerTokenTotals(ledger: Ledger): string {
+	const steps = ledger.steps ?? [];
+	const rows = new Map<string, { role: Role | "UNKNOWN"; model: string; usage: UsageTotals }>();
+	if (steps.length > 0) {
+		for (const step of steps) {
+			const key = `${step.role}\u0000${step.model}`;
+			const current = rows.get(key) ?? { role: step.role, model: step.model, usage: { in: 0, out: 0, cache_read: 0, cache_write: 0, cost: 0 } };
+			current.usage = addUsage(current.usage, step);
+			rows.set(key, current);
+		}
+	} else {
+		for (const [model, usage] of Object.entries(ledger.totals ?? {})) rows.set(`UNKNOWN\u0000${model}`, { role: "UNKNOWN", model, usage });
+	}
+	const entries = Array.from(rows.values()).sort((a, b) => {
+		const roleOrder = (role: Role | "UNKNOWN") => (role === "ANALYST" ? 0 : role === "WORKER" ? 1 : 2);
+		return roleOrder(a.role) - roleOrder(b.role) || a.model.localeCompare(b.model);
+	});
+	if (entries.length === 0) return "- none yet";
+	const total = entries.reduce((acc, entry) => addUsage(acc, entry.usage), { in: 0, out: 0, cache_read: 0, cache_write: 0, cost: 0 });
+	const tableRows = [
+		["Role", "Model", "In", "Out", "Cache read", "Cache write", "Cost"],
+		...entries.map((entry) => [
+			formatRole(entry.role),
+			entry.model,
+			formatTokenCount(entry.usage.in),
+			formatTokenCount(entry.usage.out),
+			formatTokenCount(entry.usage.cache_read),
+			formatTokenCount(entry.usage.cache_write),
+			formatMoneyShort(entry.usage.cost),
+		]),
+		[formatRole("TOTAL"), "", formatTokenCount(total.in), formatTokenCount(total.out), formatTokenCount(total.cache_read), formatTokenCount(total.cache_write), formatMoneyShort(total.cost)],
+	];
+	return makeTextTable(tableRows, ["left", "left", "right", "right", "right", "right", "right"]);
+}
+
+function toolTimingCategory(toolName: string): string {
+	if (/^(web_search|code_search|fetch_content|get_search_content)$/i.test(toolName)) return "Web/search";
+	if (/^bash$/i.test(toolName)) return "Shell/commands";
+	if (/^(read|ls|grep|find)$/i.test(toolName)) return "File reads/search";
+	if (/^(edit|write)$/i.test(toolName)) return "File edits/writes";
+	if (/^pdf_/i.test(toolName)) return "PDF tools";
+	return "Other tools";
+}
+
+function share(ms: number, total: number): string {
+	if (!Number.isFinite(ms) || ms <= 0 || !Number.isFinite(total) || total <= 0) return "0%";
+	const pct = (ms / total) * 100;
+	if (pct > 0 && pct < 1) return "<1%";
+	return `${Math.round(pct)}%`;
+}
+
+function formatStepSummary(turn: ActiveTurn, usage: UsageTotals, timing: StepTiming, stateAfter: AwStateName, ledger: Ledger, reportPath: string): string {
+	const stepRows = [
+		["Step", "Role", "Phase", "Model", "Thinking", "State"],
+		[stepId(turn.step), formatRole(turn.role), phaseLabel(turn.phase), turn.model, turn.thinkingLevel, stateAfter],
+	];
+	const usageRows = [
+		["In", "Out", "Cache read", "Cache write", "Cost"],
+		[formatTokenCount(usage.in), formatTokenCount(usage.out), formatTokenCount(usage.cache_read), formatTokenCount(usage.cache_write), formatMoneyShort(usage.cost)],
+	];
+	const timeRows = [
+		["Activity", "Time"],
+		["Wall", formatDuration(timing.wall_ms)],
+		["LLM/orchestration", formatDuration(timing.llm_ms)],
+		["Tools/experiments", timing.tool_ms > 0 ? formatDuration(timing.tool_ms) : "–"],
+		...(timing.external_ms > 0 ? [["External analyst subprocess", formatDuration(timing.external_ms)]] : []),
+	];
+	const finalTotals = stateAfter === "DONE_NEEDS_OPERATOR_CONFIRMATION" ? `\n\nTime totals\n${ledgerTimingSummary(ledger)}\n\nRecommended archive action\n  /analyst-worker archive --keep-tmp` : "";
+	return `Step summary\n${makeTextTable(stepRows, ["right", "left", "left", "left", "left", "left"])}\n\nStep usage\n${makeTextTable(usageRows, ["right", "right", "right", "right", "right"])}\n\nStep time\n${makeTextTable(timeRows, ["left", "right"])}\n\nToken totals\n${formatLedgerTokenTotals(ledger)}${finalTotals}\n\nReport\n  ${reportPath}`;
+}
+
+function escapeRegex(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractNamedSection(text: string, names: string[], max = 3500): string {
+	const labels = names.map(escapeRegex).join("|");
+	const startRe = new RegExp(`(?:^|\\n)\\s*(?:#{1,3}\\s*)?(?:${labels})\\s*:?\\s*\\n`, "i");
+	const match = startRe.exec(text);
+	if (!match || match.index === undefined) return "";
+	const bodyStart = match.index + match[0].length;
+	const rest = text.slice(bodyStart);
+	const next = rest.search(/\n\s*(?:#{1,3}\s*)?(?:Diagnosis \/ Review|Hypothesis|Worker instruction|Validation \/ Risks|Issues \/ risks \/ lessons|Operational memory|Next state|Operator handoff|Operations reflection|Operational reflection)\s*:?\s*\n/i);
+	const body = (next >= 0 ? rest.slice(0, next) : rest).trim();
+	return truncate(body, max);
+}
+
+async function finalOperationalNotes(run: AwRun, ledger: Ledger, cwd: string): Promise<string> {
+	const report = await readSnippet(run.lastAnalystReportPath ? resolve(cwd, run.lastAnalystReportPath) : undefined, 24000);
+	const reflection = extractNamedSection(report, ["Operations reflection", "Operational reflection"], 4000) || extractNamedSection(report, ["Operator handoff"], 4000);
+	const steps = ledger.steps ?? [];
+	const slowest = steps
+		.slice()
+		.sort((a, b) => (b.wall_ms ?? 0) - (a.wall_ms ?? 0))[0];
+	const toolErrors = steps.reduce((total, step) => total + (step.tool_errors ?? 0), 0);
+	const failedCompactions = (ledger.compactions ?? []).filter((item) => item.status === "failed").length;
+	const facts = [
+		slowest ? `Slowest step: ${stepId(slowest.step)} ${formatRole(slowest.role)} ${phaseLabel(slowest.phase)} — ${formatDuration(slowest.wall_ms ?? 0)}.` : undefined,
+		toolErrors ? `Tool errors recorded: ${toolErrors}.` : undefined,
+		failedCompactions ? `Failed compactions: ${failedCompactions}.` : undefined,
+	].filter(Boolean);
+	return [`Final analyst reflection`, reflection || `- No explicit final operational reflection was captured. Review latest analyst report: ${run.lastAnalystReportPath ?? "not recorded"}`, facts.length ? `\nLedger-derived operational facts\n${facts.map((fact) => `- ${fact}`).join("\n")}` : undefined].filter(Boolean).join("\n");
+}
+
 function ledgerTimingSummary(ledger: Ledger): string {
 	const steps = ledger.steps ?? [];
 	const compactions = ledger.compactions ?? [];
 	const sum = (values: number[]) => values.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
-	const wall = sum(steps.map((step) => step.wall_ms ?? 0));
-	const tools = sum(steps.map((step) => step.tool_ms ?? 0));
-	const llm = sum(steps.map((step) => step.llm_ms ?? Math.max(0, (step.wall_ms ?? 0) - (step.tool_ms ?? 0))));
+	const endToEnd = Math.max(0, Date.now() - Date.parse(ledger.started_at));
+	const toolMs = sum(steps.map((step) => step.tool_ms ?? 0));
 	const external = sum(steps.map((step) => step.external_ms ?? 0));
-	const analyst = sum(steps.filter((step) => step.role === "ANALYST").map((step) => step.wall_ms ?? 0));
-	const worker = sum(steps.filter((step) => step.role === "WORKER").map((step) => step.wall_ms ?? 0));
+	const analystLlm = sum(steps.filter((step) => step.role === "ANALYST").map((step) => step.llm_ms ?? Math.max(0, (step.wall_ms ?? 0) - (step.tool_ms ?? 0))));
+	const workerLlm = sum(steps.filter((step) => step.role === "WORKER").map((step) => step.llm_ms ?? Math.max(0, (step.wall_ms ?? 0) - (step.tool_ms ?? 0))));
 	const compactionWall = sum(compactions.map((item) => item.wall_ms ?? 0));
+	const failedCompactions = compactions.filter((item) => item.status === "failed").length;
 	const toolCounts: Record<string, number> = {};
+	const toolMsByCategory: Record<string, number> = {};
 	let toolErrors = 0;
 	for (const step of steps) {
 		toolErrors += step.tool_errors ?? 0;
 		for (const [name, count] of Object.entries(step.tool_counts ?? {})) toolCounts[name] = (toolCounts[name] ?? 0) + count;
+		for (const [name, ms] of Object.entries(step.tool_ms_by_name ?? {})) {
+			const category = toolTimingCategory(name);
+			toolMsByCategory[category] = (toolMsByCategory[category] ?? 0) + ms;
+		}
 	}
+	const categorizedToolMs = sum(Object.values(toolMsByCategory));
+	if (toolMs > 0 && categorizedToolMs === 0) toolMsByCategory["Tools/experiments"] = toolMs;
+	const timeRows: string[][] = [
+		["Phase / activity", "Time", "Share"],
+		["End-to-end", formatDuration(endToEnd), "100%"],
+	];
+	if (analystLlm > 0) timeRows.push(["Analyst LLM/review", formatDuration(analystLlm), share(analystLlm, endToEnd)]);
+	if (workerLlm > 0) timeRows.push(["Worker LLM/implementation", formatDuration(workerLlm), share(workerLlm, endToEnd)]);
+	for (const [category, ms] of Object.entries(toolMsByCategory).sort((a, b) => b[1] - a[1])) {
+		if (ms > 0) timeRows.push([category, formatDuration(ms), share(ms, endToEnd)]);
+	}
+	const compactionLabel = `Compaction (${compactions.length} run${compactions.length === 1 ? "" : "s"}${failedCompactions ? `, ${failedCompactions} failed` : ""})`;
+	timeRows.push([compactionLabel, compactionWall > 0 ? formatDuration(compactionWall) : "–", share(compactionWall, endToEnd)]);
+
 	const topTools = Object.entries(toolCounts)
 		.sort((a, b) => b[1] - a[1])
 		.slice(0, 8)
 		.map(([name, count]) => `${name}×${count}`)
 		.join(", ");
-	return [
-		`End-to-end since start: ${formatDuration(Date.now() - Date.parse(ledger.started_at))}`,
-		`Recorded step wall time: ${formatDuration(wall)} (Analyst ${formatDuration(analyst)}, Worker ${formatDuration(worker)})`,
-		`LLM/orchestration: ${formatDuration(llm)}, tools/experiments: ${formatDuration(tools)}${external ? `, external analyst subprocess: ${formatDuration(external)}` : ""}`,
-		`Compaction: ${formatDuration(compactionWall)} across ${compactions.length} run(s)`,
-		topTools ? `Tool calls: ${topTools}${toolErrors ? `; tool errors: ${toolErrors}` : ""}` : undefined,
-	].filter(Boolean).join("\n");
+	const details = [
+		external ? `External analyst subprocess  ${formatDuration(external)}` : undefined,
+		topTools ? `Tool calls                   ${topTools}${toolErrors ? `; tool errors: ${toolErrors}` : ""}` : undefined,
+	].filter(Boolean);
+	return [makeTextTable(timeRows, ["left", "right", "right"]), details.length ? `\nOperational details\n${details.join("\n")}` : undefined].filter(Boolean).join("\n");
 }
 
 function preferencesPath(cwd: string): string {
@@ -739,6 +907,7 @@ function normalizePreferences(prefs: AwPreferences): AwPreferences {
 		workerContextLimitTokens: asNumber(String(prefs.workerContextLimitTokens ?? ""), 128000),
 		toolPolicy: "all-tools",
 		maxWorkerStepsBeforeOperator: 1,
+		maxAutonomousHours: asPositiveNumber(prefs.maxAutonomousHours, DEFAULT_MAX_AUTONOMOUS_HOURS),
 		artifactPolicy: "keep-tmp",
 		updatedAt: prefs.updatedAt ?? nowIso(),
 	};
@@ -766,14 +935,15 @@ async function readPreferencesFile(file: string): Promise<AwPreferences | undefi
 	}
 }
 
-async function readPreferencesSource(cwd: string): Promise<{ prefs: AwPreferences; source: string } | undefined> {
+async function readPreferencesSource(cwd: string): Promise<{ prefs: AwPreferences; source: string; needsAutonomousHours: boolean } | undefined> {
 	const localFile = preferencesPath(cwd);
 	const globalFile = globalPreferencesPath();
 	const [globalPrefs, localPrefs] = await Promise.all([readPreferencesFile(globalFile), readPreferencesFile(localFile)]);
+	const needsAutonomousHours = !localPrefs?.maxAutonomousHours && !globalPrefs?.maxAutonomousHours;
 	const prefs = mergePreferences(globalPrefs, localPrefs);
 	if (!prefs) return undefined;
 	const source = localPrefs && globalPrefs ? `${SETTINGS_FILE} + ${globalFile}` : localPrefs ? SETTINGS_FILE : globalFile;
-	return { prefs, source };
+	return { prefs, source, needsAutonomousHours };
 }
 
 async function readPreferences(cwd: string): Promise<AwPreferences | undefined> {
@@ -792,6 +962,7 @@ async function writePreferences(cwd: string, settings: WorkflowSettings): Promis
 		workerThinkingLevel: normalizeThinkingLevel(settings.workerThinkingLevel, DEFAULT_ROLE_THINKING.WORKER),
 		toolPolicy: "all-tools",
 		maxWorkerStepsBeforeOperator: 1,
+		maxAutonomousHours: asPositiveNumber(settings.maxAutonomousHours, DEFAULT_MAX_AUTONOMOUS_HOURS),
 		artifactPolicy: "keep-tmp",
 	};
 	const prefs: AwPreferences = { version: EXTENSION_VERSION, ...normalized, updatedAt: nowIso() };
@@ -811,6 +982,7 @@ function settingsFromPreferences(prefs: AwPreferences): WorkflowSettings {
 		workerContextLimitTokens: normalized.workerContextLimitTokens,
 		toolPolicy: "all-tools",
 		maxWorkerStepsBeforeOperator: 1,
+		maxAutonomousHours: normalized.maxAutonomousHours ?? DEFAULT_MAX_AUTONOMOUS_HOURS,
 		artifactPolicy: "keep-tmp",
 	};
 }
@@ -825,12 +997,30 @@ function settingsFromRun(run: AwRun): WorkflowSettings {
 		workerContextLimitTokens: run.config.workerContextLimitTokens,
 		toolPolicy: "all-tools",
 		maxWorkerStepsBeforeOperator: 1,
+		maxAutonomousHours: run.config.maxAutonomousHours ?? DEFAULT_MAX_AUTONOMOUS_HOURS,
 		artifactPolicy: "keep-tmp",
 	};
 }
 
 function settingsSummary(settings: WorkflowSettings | AwPreferences): string {
-	return `Analyst model: ${settings.analystModel}\nAnalyst thinking: ${normalizeThinkingLevel(settings.analystThinkingLevel, DEFAULT_ROLE_THINKING.ANALYST)}\nWorker model: ${settings.workerModel}\nWorker thinking: ${normalizeThinkingLevel(settings.workerThinkingLevel, DEFAULT_ROLE_THINKING.WORKER)}\nAnalyst context limit: ${settings.analystContextLimitTokens}\nWorker context limit: ${settings.workerContextLimitTokens}\nTool policy: all-tools (always enabled)\nWorkflow: automatic analyst → worker loop until done/blocked/operator-needed`;
+	const analystThinking = normalizeThinkingLevel(settings.analystThinkingLevel, DEFAULT_ROLE_THINKING.ANALYST);
+	const workerThinking = normalizeThinkingLevel(settings.workerThinkingLevel, DEFAULT_ROLE_THINKING.WORKER);
+	return `${makeTextTable(
+		[
+			["Role", "Model", "Thinking", "Context"],
+			["Analyst", settings.analystModel, analystThinking, formatTokenCount(settings.analystContextLimitTokens)],
+			["Worker", settings.workerModel, workerThinking, formatTokenCount(settings.workerContextLimitTokens)],
+		],
+		["left", "left", "left", "right"],
+	)}\n\nSafety   operator checkpoint after ${formatHours(asPositiveNumber(settings.maxAutonomousHours, DEFAULT_MAX_AUTONOMOUS_HOURS))} autonomous runtime\nTools    all-tools (always enabled)\nWorkflow automatic Analyst → Worker loop until done/blocked/operator-needed`;
+}
+
+function probeOkSummary(role: Role, model: string, thinkingLevel: ThinkingLevel): string {
+	return `[SYSTEM]\nModel probe passed\n\n${makeTextTable([
+		["Role", formatRole(role)],
+		["Model", model],
+		["Thinking", thinkingLevel],
+	])}`;
 }
 
 function stateMarkdown(run: AwRun): string {
@@ -857,6 +1047,8 @@ Artifact dir: ${run.config.artifactDir}
 Ledger: ${displayPath(ledgerPath(run), run.config.cwd)}
 Tool policy: ${run.config.toolPolicy}
 Archive policy: ${run.config.artifactPolicy}
+Autonomous runtime checkpoint: ${formatHours(run.config.maxAutonomousHours ?? DEFAULT_MAX_AUTONOMOUS_HOURS)}
+Autonomous runtime started: ${run.autonomousStartedAt ?? run.config.startedAt}
 Autonomous worker steps since operator: ${run.workerStepsSinceOperator ?? 0}
 
 ## Global task description
@@ -909,6 +1101,7 @@ function timingForTurn(turn: ActiveTurn, finishedMs = Date.now()): StepTiming {
 		tool_ms: tool,
 		external_ms: external,
 		llm_ms: Math.max(0, wall - tool),
+		tool_ms_by_name: { ...(turn.toolMsByName ?? {}) },
 		tool_counts: { ...(turn.toolCounts ?? {}) },
 		tool_errors: turn.toolErrors ?? 0,
 	};
@@ -996,6 +1189,7 @@ function createRun(ctx: ExtensionCommandContext, config: Omit<AwConfig, "cwd" | 
 		operatorExpected: "No: analyst planning starts automatically.",
 		operatorModel: ctx.model ? modelRef(ctx.model) : undefined,
 		workerStepsSinceOperator: 0,
+		autonomousStartedAt: startedAt,
 		updatedAt: startedAt,
 	};
 }
@@ -1021,6 +1215,7 @@ function clampSettingsForModels(ctx: ExtensionContext, settings: WorkflowSetting
 		...settings,
 		analystThinkingLevel: clampThinkingLevelForModel(findModel(ctx, settings.analystModel), settings.analystThinkingLevel),
 		workerThinkingLevel: clampThinkingLevelForModel(findModel(ctx, settings.workerModel), settings.workerThinkingLevel),
+		maxAutonomousHours: asPositiveNumber(settings.maxAutonomousHours, DEFAULT_MAX_AUTONOMOUS_HOURS),
 	};
 }
 
@@ -1225,7 +1420,7 @@ async function chooseThinkingLevel(ctx: ExtensionCommandContext, role: Role, ref
 	return selectedThinkingLevel(choice);
 }
 
-async function chooseNumber(ctx: ExtensionCommandContext, title: string, fallback: number): Promise<number | undefined> {
+async function chooseNumberWithParser(ctx: ExtensionCommandContext, title: string, fallback: number, parser: (value: string | undefined, fallback: number) => number): Promise<number | undefined> {
 	if (!ctx.hasUI) return fallback;
 	const initial = String(fallback);
 	const value = await ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
@@ -1273,7 +1468,15 @@ async function chooseNumber(ctx: ExtensionCommandContext, title: string, fallbac
 			},
 		};
 	});
-	return value === undefined ? undefined : asNumber(value, fallback);
+	return value === undefined ? undefined : parser(value, fallback);
+}
+
+async function chooseNumber(ctx: ExtensionCommandContext, title: string, fallback: number): Promise<number | undefined> {
+	return chooseNumberWithParser(ctx, title, fallback, asNumber);
+}
+
+async function choosePositiveNumber(ctx: ExtensionCommandContext, title: string, fallback: number): Promise<number | undefined> {
+	return chooseNumberWithParser(ctx, title, fallback, asPositiveNumber);
 }
 
 function toolAllowed(policy: ToolPolicy, toolName: string): boolean {
@@ -1285,6 +1488,18 @@ function toolAllowed(policy: ToolPolicy, toolName: string): boolean {
 
 function roleContextLimit(run: AwRun, role: Role): number {
 	return role === "ANALYST" ? run.config.analystContextLimitTokens : run.config.workerContextLimitTokens;
+}
+
+function maxAutonomousHours(run: AwRun): number {
+	return asPositiveNumber(run.config.maxAutonomousHours, DEFAULT_MAX_AUTONOMOUS_HOURS);
+}
+
+function autonomousElapsedMs(run: AwRun): number {
+	return Math.max(0, Date.now() - Date.parse(run.autonomousStartedAt ?? run.config.startedAt));
+}
+
+function shouldStopForAutonomousRuntime(run: AwRun): boolean {
+	return autonomousElapsedMs(run) >= maxAutonomousHours(run) * 60 * 60 * 1000;
 }
 
 function buildRolePrompt(run: AwRun, turn: ActiveTurn): string {
@@ -1310,6 +1525,7 @@ Constraints:
 - Worker thinking level: ${roleThinkingLevel(run, "WORKER")}
 - Analyst context limit: ${run.config.analystContextLimitTokens}
 - Worker context limit: ${run.config.workerContextLimitTokens}
+- Autonomous runtime checkpoint: ${formatHours(maxAutonomousHours(run))}
 - No autonomous infinite loop. Return control according to the role protocol.
 - Keep context compact: do not paste large logs, full fetched pages, or long source files into chat. Save raw outputs under the artifact dir and summarize only the relevant findings with file paths.
 `;
@@ -1324,6 +1540,8 @@ Required sections:
 ## Hypothesis
 ## Worker instruction
 ## Validation / Risks
+## Operational memory
+Carry forward known failed commands, benchmark caveats, environment constraints, suspicious results, slow steps, and lessons from previous Worker reports.
 ## Next state
 ## Operator handoff
 
@@ -1342,6 +1560,8 @@ Required sections:
 ## Result
 ## Validation
 ## Diff / artifacts
+## Issues / risks / lessons
+Always list failed commands, retries, surprising results, benchmark noise/variance, environment caveats, slow operations, and anything the analyst should remember. Write 'None' only if genuinely none.
 ## Worker recommendation / next steps
 ## Stop / handoff
 `;
@@ -1356,6 +1576,8 @@ Required sections:
 ## Hypothesis
 ## Worker instruction
 ## Validation / Risks
+## Operational memory
+Carry forward known failed commands, benchmark caveats, environment constraints, suspicious results, slow steps, and lessons from previous Worker reports.
 ## Next state
 ## Operator handoff
 
@@ -1498,7 +1720,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		}
 		if (result.ok) {
 			validatedModels.add(validationKey);
-			sendMessage(`[SYSTEM]\nProbe OK: ${role.toLowerCase()} model ${ref} is available with ${effectiveThinking} thinking.`, { type: "progress", role, model: ref, thinkingLevel: effectiveThinking });
+			sendMessage(probeOkSummary(role, ref, effectiveThinking), { type: "progress", role, model: ref, thinkingLevel: effectiveThinking });
 			return true;
 		}
 		const reason = `${role.toLowerCase()} model ${ref} with ${effectiveThinking} thinking failed an availability probe: ${result.error}`;
@@ -1524,6 +1746,8 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		}
 		run = restored;
 		if (run && typeof run.workerStepsSinceOperator !== "number") run.workerStepsSinceOperator = 0;
+		if (run && !run.config.maxAutonomousHours) run.config.maxAutonomousHours = DEFAULT_MAX_AUTONOMOUS_HOURS;
+		if (run && !run.autonomousStartedAt) run.autonomousStartedAt = run.config.startedAt;
 		updateStatus(ctx);
 		if (run && shouldRestoreInteractiveModel(run)) {
 			void restoreInteractiveModel(ctx, "session restore").catch(() => undefined);
@@ -1662,7 +1886,10 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		const nextStep = run.currentStep + 1;
 		if (await maybeCompactBeforeTurn(ctx, phase, ref, nextStep)) return;
 
-		if (!auto) run.workerStepsSinceOperator = 0;
+		if (!auto) {
+			run.workerStepsSinceOperator = 0;
+			run.autonomousStartedAt = nowIso();
+		}
 		run.currentStep = nextStep;
 		run.state = phaseState(phase);
 		run.nextRole = role;
@@ -1681,6 +1908,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			startedAt: nowIso(),
 			auto,
 			toolMs: 0,
+			toolMsByName: {},
 			toolCounts: {},
 			toolErrors: 0,
 			externalMs: 0,
@@ -1744,7 +1972,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		let nextPhase: Phase | null = "WORKER_RUN";
 		let nextRole: Role | null = "WORKER";
 		let autoNextPhase: Phase | null = null;
-		let reason = `${turn.role.toLowerCase()} ${phaseLabel(turn.phase)} finished`;
+		let reason = `${phaseLabel(turn.phase)} finished`;
 		let expected = "No operator action needed; workflow is continuing automatically.";
 
 		const stopDone = () => {
@@ -1831,14 +2059,16 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 				stopAbort();
 			} else if (next === "NEEDS_OPERATOR") {
 				stopNeedsOperator();
-			} else if ((run.workerStepsSinceOperator ?? 0) >= MAX_AUTONOMOUS_WORKER_STEPS) {
-				stateAfter = "BLOCKED_NEEDS_OPERATOR";
+			} else if (shouldStopForAutonomousRuntime(run)) {
+				stateAfter = "WAITING_FOR_OPERATOR";
 				nextPhase = "WORKER_RUN";
 				nextRole = "WORKER";
 				autoNextPhase = null;
-				run.nextAction = "Safety stop: many worker stages ran without operator input. Inspect progress, then run /analyst-worker to continue.";
+				const elapsed = formatDuration(autonomousElapsedMs(run));
+				const limit = formatHours(maxAutonomousHours(run));
+				run.nextAction = `Autonomous runtime reached ${elapsed} (limit ${limit}). Inspect progress, then run /analyst-worker to continue.`;
 				run.operatorExpected = "Yes: inspect progress and explicitly continue if desired.";
-				reason = "safety stop after many autonomous worker stages";
+				reason = `autonomous runtime checkpoint after ${elapsed} (limit ${limit})`;
 				expected = "Inspect state/reports, then run /analyst-worker to continue or steer.";
 			} else {
 				continueWithWorker("analyst reviewed the result and planned the next worker stage; starting worker automatically");
@@ -1880,10 +2110,11 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		});
 		await writeLedger(run, ledger);
 
-		const totalsText = Object.entries(ledger.totals)
-			.map(([model, total]) => `  ${model}: IN ${total.in}, OUT ${total.out}, cache read ${total.cache_read}, cache write ${total.cache_write}, cost ${formatMoney(total.cost)}`)
-			.join("\n");
-		const usageBlock = `Step usage (${turn.model}, ${turn.thinkingLevel} thinking): ${formatUsage(usage)}\nStep time: ${formatTiming(timing)}\nCumulative by model:\n${totalsText || "  none"}\nReport: ${run.lastReportPath}`;
+		let usageBlock = formatStepSummary(turn, usage, timing, stateAfter, ledger, run.lastReportPath);
+		if (stateAfter === "DONE_NEEDS_OPERATOR_CONFIRMATION") {
+			const reflection = extractNamedSection(text, ["Operations reflection", "Operational reflection"], 3500) || extractNamedSection(text, ["Operator handoff"], 3500);
+			if (reflection) usageBlock += `\n\nFinal analyst reflection\n${reflection}`;
+		}
 		if (autoNextPhase) {
 			sendMessage(
 				`${turnHeader(run, turn)}\nState: CONTINUING\nAction: ${reason}\nNext: ${phaseLabel(autoNextPhase)} (${phaseRole(autoNextPhase)})\n\n${usageBlock}`,
@@ -1906,11 +2137,8 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const ledger = await readLedger(run);
-		const totalsText = Object.entries(ledger.totals)
-			.map(([model, total]) => `- ${model}: IN ${total.in}, OUT ${total.out}, cache read ${total.cache_read}, cache write ${total.cache_write}, cost ${formatMoney(total.cost)}`)
-			.join("\n");
 		sendMessage(
-			`[OPERATOR HANDOFF]\nState: ${run.state}\nReason: status requested\nExpected operator input:\n  ${run.nextAction}\n\nTask: ${run.config.taskTitle}\nStep: ${run.currentStep}\nPaused: ${run.paused ? "yes" : "no"}\nState file: ${displayPath(statePath(run), ctx.cwd)}\nLedger: ${displayPath(ledgerPath(run), ctx.cwd)}\nNext role: ${run.nextRole ?? "none"}\nNext phase: ${run.nextPhase ?? "none"}\nAnalyst: ${run.config.analystModel} (${roleThinkingLevel(run, "ANALYST")} thinking)\nWorker: ${run.config.workerModel} (${roleThinkingLevel(run, "WORKER")} thinking)\n\nToken totals:\n${totalsText || "- none yet"}\n\nTime totals:\n${ledgerTimingSummary(ledger)}`,
+			`[OPERATOR HANDOFF]\nState: ${run.state}\nReason: status requested\nExpected operator input:\n  ${run.nextAction}\n\nTask: ${run.config.taskTitle}\nStep: ${run.currentStep}\nPaused: ${run.paused ? "yes" : "no"}\nState file: ${displayPath(statePath(run), ctx.cwd)}\nLedger: ${displayPath(ledgerPath(run), ctx.cwd)}\nNext role: ${run.nextRole ?? "none"}\nNext phase: ${run.nextPhase ?? "none"}\nAnalyst: ${run.config.analystModel} (${roleThinkingLevel(run, "ANALYST")} thinking)\nWorker: ${run.config.workerModel} (${roleThinkingLevel(run, "WORKER")} thinking)\n\nToken totals:\n${formatLedgerTokenTotals(ledger)}\n\nTime totals:\n${ledgerTimingSummary(ledger)}`,
 			{ type: "status", run, ledger },
 		);
 	}
@@ -1920,7 +2148,9 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		const details = message.details as { type?: string } | undefined;
 		const isError =
 			details?.type === "model-probe-failed" ||
-			/\bfailed an availability probe\b|\bCompaction failed\b|\bError:/i.test(text) ||
+			details?.type === "compaction-failed" ||
+			/^Error:/im.test(text) ||
+			/\bfailed an availability probe\b|\bCompaction failed\b/i.test(text) ||
 			/\bState:\s*(BLOCKED_NEEDS_OPERATOR|ABORTED)\b/i.test(text);
 		if (isError) return new Text(theme.fg("error", text), 0, 0);
 		return undefined;
@@ -1970,7 +2200,9 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		if (!started) return;
 		activeToolStarts.delete(event.toolCallId);
 		if (!activeTurn || activeTurn.step !== started.step) return;
-		activeTurn.toolMs += Math.max(0, Date.now() - started.started);
+		const elapsed = Math.max(0, Date.now() - started.started);
+		activeTurn.toolMs += elapsed;
+		activeTurn.toolMsByName[started.toolName] = (activeTurn.toolMsByName[started.toolName] ?? 0) + elapsed;
 		activeTurn.toolCounts[started.toolName] = (activeTurn.toolCounts[started.toolName] ?? 0) + 1;
 		if (event.isError) activeTurn.toolErrors += 1;
 	});
@@ -2065,6 +2297,12 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			defaults?.workerContextLimitTokens ?? 128000,
 		);
 		if (!workerContextLimitTokens) return undefined;
+		const maxAutonomousHours = await choosePositiveNumber(
+			ctx,
+			"Max autonomous runtime hours before operator checkpoint — can be fractional, e.g. 0.5; recommended/default: 24",
+			defaults?.maxAutonomousHours ?? DEFAULT_MAX_AUTONOMOUS_HOURS,
+		);
+		if (!maxAutonomousHours) return undefined;
 		return {
 			analystModel: analyst.model,
 			analystThinkingLevel: analyst.thinkingLevel,
@@ -2074,6 +2312,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			workerContextLimitTokens,
 			toolPolicy: "all-tools",
 			maxWorkerStepsBeforeOperator: 1,
+			maxAutonomousHours,
 			artifactPolicy: "keep-tmp",
 		};
 	}
@@ -2118,7 +2357,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			await saveRun(ctx);
 		}
 		sendMessage(
-			`[OPERATOR HANDOFF]\nState: ${run?.state ?? "IDLE"}\nReason: Analyst/Worker settings updated\nExpected operator input:\n  Run /analyst-worker to continue, or /analyst-worker start <task> for a new task.\n\nSaved to:\n- ${SETTINGS_FILE}\n- ${globalPreferencesPath()}\n\nSaved settings:\n${settingsSummary(settings)}\n\nTo change them later: /analyst-worker config or /analyst-worker start --configure`,
+			`[OPERATOR HANDOFF]\nState: ${run?.state ?? "IDLE"}\nReason: Analyst/Worker settings updated\n\nExpected operator input:\n  Run /analyst-worker to continue, or /analyst-worker start <task> for a new task.\n\nSaved to:\n- ${SETTINGS_FILE}\n- ${globalPreferencesPath()}\n\nSaved settings:\n${settingsSummary(settings)}\n\nChange settings later:\n  /analyst-worker config\n  /analyst-worker start --configure`,
 			{ type: "settings-updated", settings },
 		);
 	}
@@ -2147,7 +2386,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		const prefsSource = await readPreferencesSource(ctx.cwd);
 		const prefs = prefsSource?.prefs;
 		let settings: WorkflowSettings | undefined;
-		if (prefs && !forceConfigure) {
+		if (prefs && !forceConfigure && !prefsSource?.needsAutonomousHours) {
 			sendMessage(`[SYSTEM]\nChecking saved Analyst/Worker settings and model availability...`, { type: "progress" });
 			const analystExists = Boolean(findModel(ctx, prefs.analystModel));
 			const workerExists = Boolean(findModel(ctx, prefs.workerModel));
@@ -2158,7 +2397,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 				if (analystReady && workerReady) {
 					settings = savedSettings;
 					sendMessage(
-						`[OPERATOR HANDOFF]\nState: CONFIGURING\nReason: using saved Analyst/Worker settings from ${prefsSource?.source ?? SETTINGS_FILE}\nExpected operator input:\n  Nothing needed. To change models, thinking levels, or limits, run /analyst-worker config or /analyst-worker start --configure.\n\nUsing:\n${settingsSummary(settings)}`,
+						`[OPERATOR HANDOFF]\nState: CONFIGURING\nReason: using saved Analyst/Worker settings\nSource: ${prefsSource?.source ?? SETTINGS_FILE}\n\nExpected operator input:\n  Nothing needed.\n\nChange settings:\n  /analyst-worker config\n  /analyst-worker start --configure\n\nUsing:\n${settingsSummary(settings)}`,
 						{ type: "using-saved-settings", settings },
 					);
 				}
@@ -2171,12 +2410,15 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		}
 
 		if (!settings) {
+			if (prefsSource?.needsAutonomousHours && !forceConfigure) {
+				sendMessage(`[SYSTEM]\nSaved Analyst/Worker settings need one new safety setting: max autonomous runtime hours. The field is prefilled with ${DEFAULT_MAX_AUTONOMOUS_HOURS}; edit it if desired.`, { type: "progress" });
+			}
 			const defaults = prefs ? clampSettingsForModels(ctx, settingsFromPreferences(prefs)) : run ? settingsFromRun(run) : undefined;
 			settings = await collectSettings(ctx, fallbackModel, defaults);
 			if (!settings) return;
 			await writePreferences(ctx.cwd, settings);
 			sendMessage(
-				`[OPERATOR HANDOFF]\nState: CONFIGURING\nReason: Analyst/Worker settings saved to ${SETTINGS_FILE} and ${globalPreferencesPath()}\nExpected operator input:\n  Future /analyst-worker starts will reuse these settings automatically, including in other folders.\n\nSaved settings:\n${settingsSummary(settings)}\n\nTo change them later: /analyst-worker config or /analyst-worker start --configure`,
+				`[OPERATOR HANDOFF]\nState: CONFIGURING\nReason: Analyst/Worker settings saved\n\nSaved to:\n- ${SETTINGS_FILE}\n- ${globalPreferencesPath()}\n\nExpected operator input:\n  Future /analyst-worker starts will reuse these settings automatically, including in other folders.\n\nSaved settings:\n${settingsSummary(settings)}\n\nChange settings later:\n  /analyst-worker config\n  /analyst-worker start --configure`,
 				{ type: "settings-saved", settings },
 			);
 		}
@@ -2260,10 +2502,8 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		await saveRun(ctx);
 		await restoreInteractiveModel(ctx, "finish");
 		const ledger = await readLedger(run);
-		const totalsText = Object.entries(ledger.totals)
-			.map(([model, total]) => `- ${model}: ${formatUsage(total)}`)
-			.join("\n");
-		sendMessage(`[TASK COMPLETE — OPERATOR CONFIRMATION REQUIRED]\nAnalyst: ${run.config.analystModel} (${roleThinkingLevel(run, "ANALYST")} thinking)\nWorker: ${run.config.workerModel} (${roleThinkingLevel(run, "WORKER")} thinking)\nResult: task marked complete by operator\nValidation: see ${displayPath(statePath(run), ctx.cwd)} and ${displayPath(ledgerPath(run), ctx.cwd)}\n\nToken totals:\n${totalsText || "- none"}\n\nTime totals:\n${ledgerTimingSummary(ledger)}\n\nOperational notes:\n- Review latest Analyst/Worker reports for blockers, failed commands, suspicious benchmark variance, and compaction/model issues before archiving.\n- If important errors occurred, include them in the final analyst summary so future runs can avoid them.\n\nRecommended archive action:\n  /analyst-worker archive --keep-tmp\nQuestion:\n  Finish analyst-worker mode now?`, { type: "finish", run, ledger });
+		const operationalNotes = await finalOperationalNotes(run, ledger, ctx.cwd);
+		sendMessage(`[TASK COMPLETE — OPERATOR CONFIRMATION REQUIRED]\nAnalyst: ${run.config.analystModel} (${roleThinkingLevel(run, "ANALYST")} thinking)\nWorker: ${run.config.workerModel} (${roleThinkingLevel(run, "WORKER")} thinking)\nResult: task marked complete by operator\nValidation: see ${displayPath(statePath(run), ctx.cwd)} and ${displayPath(ledgerPath(run), ctx.cwd)}\n\nToken totals:\n${formatLedgerTokenTotals(ledger)}\n\nTime totals:\n${ledgerTimingSummary(ledger)}\n\n${operationalNotes}\n\nRecommended archive action:\n  /analyst-worker archive --keep-tmp\nQuestion:\n  Finish analyst-worker mode now?`, { type: "finish", run, ledger });
 	}
 
 	async function archiveWorkflow(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -2395,6 +2635,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		}
 
 		run.workerStepsSinceOperator = 0;
+		run.autonomousStartedAt = nowIso();
 		await saveRun(ctx);
 		sendMessage(
 			`[OPERATOR HANDOFF]\nState: ${run.state}\nReason: operator note recorded\nExpected operator input:\n  Run /analyst-worker to choose the next action. The next analyst turn will see this note.\n\nOperator note:\n${trimmed}`,
