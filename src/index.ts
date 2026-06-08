@@ -10,6 +10,7 @@ import type {
 import { Key, matchesKey, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -60,6 +61,11 @@ interface AwConfig {
 	startedAt: string;
 }
 
+interface OperatorNote {
+	timestamp: string;
+	text: string;
+}
+
 interface AwRun {
 	version: number;
 	config: AwConfig;
@@ -73,6 +79,11 @@ interface AwRun {
 	openQuestions: string[];
 	nextAction: string;
 	operatorExpected: string;
+	operatorNotes?: OperatorNote[];
+	authorizedInstructionId?: string;
+	recoveryWorkerInstruction?: string;
+	lastCompletedWorkerInstructionId?: string;
+	lastCompletedWorkerStep?: number;
 	lastReportPath?: string;
 	lastAnalystReportPath?: string;
 	lastWorkerReportPath?: string;
@@ -98,6 +109,11 @@ interface ActiveTurn {
 	toolCounts: Record<string, number>;
 	toolErrors: number;
 	externalMs: number;
+	externalWorker?: boolean;
+	externalAttempts?: number;
+	externalLogDirs?: string[];
+	authorizedInstructionId?: string;
+	contextSanitizedToolResults?: number;
 }
 
 interface UsageTotals {
@@ -106,6 +122,15 @@ interface UsageTotals {
 	cache_read: number;
 	cache_write: number;
 	cost: number;
+}
+
+interface QuickPiPromptLogOptions {
+	dir: string;
+	label: string;
+	attempt: number;
+	role?: Role;
+	phase?: Phase;
+	step?: number;
 }
 
 interface StepTiming {
@@ -155,6 +180,7 @@ interface Ledger {
 	totals: Record<string, UsageTotals>;
 	steps: LedgerStep[];
 	compactions?: LedgerCompaction[];
+	legacy_events?: unknown[];
 }
 
 interface AwPreferences {
@@ -198,6 +224,8 @@ Hard requirements:
 - At each analyst turn, update the plan and produce exactly one small, detailed, bounded worker stage when more work is needed.
 - Do not perform worker implementation unless explicitly instructed by the operator.
 - Stop and ask the operator if results are contradictory, invalid, risky, out of scope, context/cost constrained, require credentials/network, or require a human trade-off.
+- Treat automatic recovery reconciliation as one-shot: after an auto-reconcile recovery audit is accepted or resolved, do not request another identical audit; ask the operator only if there is no already-authorized next bounded stage.
+- Do not confuse normal read-only planning/contract stages with auto-reconcile recovery. If a read-only contract stage is part of the authorized workflow and the next implementation stage is clear, bounded, and within scope, you may set NEEDS_WORKER.
 - Let the workflow continue automatically with the worker while the next state is NEEDS_WORKER.
 - In every review, read the worker's issues/risks/lessons and carry them forward.
 - In final or operator-facing reviews, include a concrete operational reflection: token/time totals, major delays, failed commands/errors, benchmark reliability concerns, and lessons to make future runs faster/better.`;
@@ -241,6 +269,19 @@ function slugify(input: string): string {
 	return slug || "task";
 }
 
+function cwdLogKey(cwd: string): string {
+	const hash = createHash("sha1").update(resolve(cwd)).digest("hex").slice(0, 10);
+	return `${slugify(resolve(cwd).split(/[\\/]+/).filter(Boolean).slice(-2).join("_"))}_${hash}`;
+}
+
+function runtimeLogRootFor(cwd: string, taskId?: string): string {
+	return join(homedir(), ".pi", "agent", "analyst-worker-runtime-logs", cwdLogKey(cwd), taskId ? slugify(taskId) : "setup");
+}
+
+function runtimeLogRoot(run: AwRun): string {
+	return runtimeLogRootFor(run.config.cwd, run.config.taskId);
+}
+
 function fallbackTaskTitle(description: string): string {
 	const cleaned = description
 		.replace(/https?:\/\/\S+/gi, " ")
@@ -278,6 +319,88 @@ function shouldSkipModelProbe(): boolean {
 	return process.env.PI_OFFLINE === "1" || process.env.PI_ANALYST_WORKER_SKIP_MODEL_PROBE === "1";
 }
 
+function isExternalTransportError(text: string): boolean {
+	return /websocket\s+error|websocket\s+closed|socket\s+hang\s+up|stream\s+ended|ended\s+without|timed?\s*out|timeout|fetch\s+failed|network\s+error|connection\s+(?:error|lost|reset|refused)|terminated/i.test(text);
+}
+
+function quickPiLogDir(log: QuickPiPromptLogOptions): string {
+	return join(log.dir, `${stepId(log.step ?? 0)}_${slugify(log.phase ?? "prompt")}_${slugify(log.label)}_attempt_${pad(log.attempt, 2)}`);
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function writeQuickPiLog(
+	log: QuickPiPromptLogOptions | undefined,
+	data: {
+		modelRef: string;
+		thinkingLevel: ThinkingLevel | undefined;
+		timeoutMs: number;
+		tools: boolean;
+		systemPrompt: string;
+		prompt: string;
+		args: string[];
+		promptTransport?: "argv" | "stdin-file";
+		promptFile?: string;
+		startedAt: string;
+		finishedAt: string;
+		wallMs: number;
+		stdout?: string;
+		stderr?: string;
+		code?: number;
+		killed?: boolean;
+		error?: string;
+		assistantCount?: number;
+		assistantStopReason?: string;
+	},
+): Promise<string | undefined> {
+	if (!log) return undefined;
+	const dir = quickPiLogDir(log);
+	try {
+		await mkdir(dir, { recursive: true });
+		await Promise.all([
+			writeFile(join(dir, "system_prompt.md"), data.systemPrompt, "utf8"),
+			writeFile(join(dir, "prompt.md"), data.prompt, "utf8"),
+			writeFile(join(dir, "stdout.jsonl"), data.stdout ?? "", "utf8"),
+			writeFile(join(dir, "stderr.txt"), data.stderr ?? "", "utf8"),
+			writeFile(
+				join(dir, "meta.json"),
+				JSON.stringify(
+					{
+						label: log.label,
+						attempt: log.attempt,
+						role: log.role,
+						phase: log.phase,
+						step: log.step,
+						modelRef: data.modelRef,
+						thinkingLevel: data.thinkingLevel,
+						timeoutMs: data.timeoutMs,
+						tools: data.tools,
+						startedAt: data.startedAt,
+						finishedAt: data.finishedAt,
+						wallMs: data.wallMs,
+						code: data.code,
+						killed: data.killed,
+						error: data.error,
+						assistantCount: data.assistantCount,
+						assistantStopReason: data.assistantStopReason,
+						promptTransport: data.promptTransport ?? "argv",
+						promptFile: data.promptFile,
+						argvPreview: data.args.map((arg) => (arg === data.systemPrompt ? "<system-prompt>" : arg === data.prompt ? "<prompt>" : arg)),
+					},
+					null,
+					2,
+				),
+				"utf8",
+			),
+		]);
+		return dir;
+	} catch {
+		return undefined;
+	}
+}
+
 async function runQuickPiPrompt(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -286,7 +409,9 @@ async function runQuickPiPrompt(
 	systemPrompt: string,
 	prompt: string,
 	timeoutMs = 30000,
-): Promise<{ ok: true; text: string; usage: UsageTotals; wallMs: number } | { ok: false; error: string; wallMs: number }> {
+	options?: { tools?: boolean; log?: QuickPiPromptLogOptions },
+): Promise<{ ok: true; text: string; usage: UsageTotals; wallMs: number; logDir?: string } | { ok: false; error: string; wallMs: number; logDir?: string }> {
+	const startedAt = nowIso();
 	const started = Date.now();
 	const args = [
 		"NODE_USE_ENV_PROXY=1",
@@ -299,33 +424,90 @@ async function runQuickPiPrompt(
 		"--no-skills",
 		"--no-prompt-templates",
 		"--no-context-files",
-		"--no-tools",
 		"--model",
 		modelRef,
 	];
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
-	args.push("--system-prompt", systemPrompt, "-p", prompt);
-	const result = await pi.exec("env", args, { cwd: ctx.cwd, timeout: timeoutMs });
+	if (!options?.tools) args.push("--no-tools");
+	const usePromptStdin = prompt.length > 30000;
+	let command = "env";
+	let execArgs = args;
+	let promptFile: string | undefined;
+	if (usePromptStdin) {
+		const logDir = options?.log ? quickPiLogDir(options.log) : join(runtimeLogRootFor(ctx.cwd), `prompt_${pathTimestamp()}_${Math.random().toString(36).slice(2, 8)}`);
+		await mkdir(logDir, { recursive: true });
+		promptFile = join(logDir, "prompt.md");
+		await writeFile(promptFile, prompt, "utf8");
+		args.push("--system-prompt", systemPrompt, "-p", "");
+		command = "bash";
+		execArgs = ["-lc", `cat ${shellQuote(promptFile)} | env ${args.map(shellQuote).join(" ")}`];
+	} else {
+		args.push("--system-prompt", systemPrompt, "-p", prompt);
+	}
+	let result: Awaited<ReturnType<ExtensionAPI["exec"]>>;
+	try {
+		result = await pi.exec(command, execArgs, { cwd: ctx.cwd, timeout: timeoutMs });
+	} catch (error) {
+		const wallMs = Date.now() - started;
+		const sanitized = sanitizeProviderError(error);
+		const logDir = await writeQuickPiLog(options?.log, {
+			modelRef,
+			thinkingLevel,
+			timeoutMs,
+			tools: Boolean(options?.tools),
+			systemPrompt,
+			prompt,
+			args,
+			promptTransport: usePromptStdin ? "stdin-file" : "argv",
+			promptFile,
+			startedAt,
+			finishedAt: nowIso(),
+			wallMs,
+			error: sanitized,
+		});
+		return { ok: false, error: sanitized, wallMs, logDir };
+	}
 	const wallMs = Date.now() - started;
-	let assistant: any | undefined;
+	const assistants: any[] = [];
 	for (const line of result.stdout.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		try {
 			const event = JSON.parse(line);
-			if (event?.type === "message_end" && event.message?.role === "assistant") assistant = event.message;
+			if (event?.type === "message_end" && event.message?.role === "assistant") assistants.push(event.message);
 		} catch {
 			// Non-JSON output is handled as an error below.
 		}
 	}
+	const assistant = assistants[assistants.length - 1];
+	const logDir = await writeQuickPiLog(options?.log, {
+		modelRef,
+		thinkingLevel,
+		timeoutMs,
+		tools: Boolean(options?.tools),
+		systemPrompt,
+		prompt,
+		args,
+		promptTransport: usePromptStdin ? "stdin-file" : "argv",
+		promptFile,
+		startedAt,
+		finishedAt: nowIso(),
+		wallMs,
+		stdout: result.stdout,
+		stderr: result.stderr,
+		code: result.code,
+		killed: result.killed,
+		assistantCount: assistants.length,
+		assistantStopReason: assistant?.stopReason,
+	});
 	if (assistant) {
 		if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
-			return { ok: false, error: sanitizeProviderError(assistant.errorMessage || `pi probe returned ${assistant.stopReason}`), wallMs };
+			return { ok: false, error: sanitizeProviderError(assistant.errorMessage || `pi probe returned ${assistant.stopReason}`), wallMs, logDir };
 		}
 		const text = textFromContent(assistant.content).trim();
-		if (result.code === 0 && text) return { ok: true, text, usage: usageFromMessages([assistant]), wallMs };
+		if (result.code === 0 && text) return { ok: true, text, usage: usageFromMessages(assistants), wallMs, logDir };
 	}
 	const error = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
-	return { ok: false, error: sanitizeProviderError(error || `pi probe exited with code ${result.code}${result.killed ? " (timeout)" : ""}`), wallMs };
+	return { ok: false, error: sanitizeProviderError(error || `pi probe exited with code ${result.code}${result.killed ? " (timeout)" : ""}`), wallMs, logDir };
 }
 
 async function generateTaskTitle(pi: ExtensionAPI, ctx: ExtensionCommandContext, description: string, analystModelRef: string, analystThinkingLevel: ThinkingLevel): Promise<string> {
@@ -393,14 +575,65 @@ async function readSnippet(path: string | undefined, max = 12000): Promise<strin
 	}
 }
 
+function extractMarkdownSection(text: string, names: string[], max = 12000): string {
+	const labels = names.map(escapeRegex).join("|");
+	const startRe = new RegExp(`(?:^|\\n)\\s*#{1,3}\\s*(?:${labels})\\s*:?\\s*\\n`, "i");
+	const match = startRe.exec(text);
+	if (!match || match.index === undefined) return "";
+	const start = match.index + match[0].length;
+	const rest = text.slice(start);
+	const next = rest.search(/\n\s*#{1,3}\s+[^\n]+\n/);
+	return truncate((next >= 0 ? rest.slice(0, next) : rest).trim(), max);
+}
+
+async function readReportForExternalAnalyst(path: string | undefined, max = 24000): Promise<string> {
+	if (!path) return "";
+	try {
+		const text = await readFile(path, "utf8");
+		const critical = extractMarkdownSection(text, ["Acceptance-critical final answer", "Role final answer", "Final compact summary"], 14000);
+		const usage = extractMarkdownSection(text, ["Token usage"], 1200);
+		const timing = extractMarkdownSection(text, ["Wall time"], 1200);
+		const head = truncate(text.slice(0, 5000), 5000);
+		const tail = text.length > 9000 ? text.slice(-5000) : "";
+		const parts = [
+			critical ? `## Acceptance-critical final answer (prioritize this over raw transcript)\n${critical}` : "",
+			timing ? `## Timing\n${timing}` : "",
+			usage ? `## Usage\n${usage}` : "",
+			`## Report head\n${head}`,
+			tail ? `## Report tail\n${tail}` : "",
+		].filter(Boolean);
+		return truncate(parts.join("\n\n"), max);
+	} catch {
+		return "";
+	}
+}
+
+async function readWorkerInstructionIdFromReport(run: AwRun): Promise<{ instructionId?: string; step?: number }> {
+	if (!run.lastWorkerReportPath) return {};
+	try {
+		const text = await readFile(resolve(run.config.cwd, run.lastWorkerReportPath), "utf8");
+		const instructionId = text.match(/(?:^|\n)Authorized instruction id:\s*([^\n]+)/i)?.[1]?.trim();
+		const stepText = text.match(/(?:^|\n)Step:\s*(\d+)/i)?.[1];
+		const step = stepText ? Number(stepText) : undefined;
+		return {
+			instructionId: instructionId && instructionId !== "none" ? instructionId : undefined,
+			step: Number.isFinite(step) ? step : undefined,
+		};
+	} catch {
+		return {};
+	}
+}
+
 async function buildExternalAnalystPrompt(run: AwRun, turn: ActiveTurn): Promise<string> {
 	const state = await readSnippet(statePath(run), 14000);
 	const ledger = await readSnippet(ledgerPath(run), 8000);
-	const latestWorker = await readSnippet(run.lastWorkerReportPath ? resolve(run.config.cwd, run.lastWorkerReportPath) : undefined, 18000);
-	const latestAnalyst = await readSnippet(run.lastAnalystReportPath ? resolve(run.config.cwd, run.lastAnalystReportPath) : undefined, 8000);
+	const latestWorker = await readReportForExternalAnalyst(run.lastWorkerReportPath ? resolve(run.config.cwd, run.lastWorkerReportPath) : undefined, 26000);
+	const latestAnalyst = await readReportForExternalAnalyst(run.lastAnalystReportPath ? resolve(run.config.cwd, run.lastAnalystReportPath) : undefined, 12000);
 	return `${buildRolePrompt(run, turn)}
 
 Embedded workflow state (because this analyst turn runs in a proxy-safe subprocess without tools):
+
+Important: for worker reports, prioritize the "Acceptance-critical final answer" section. The raw transcript can contain stale pre-compaction fragments and long tool outputs; do not reject a worker result merely because the raw transcript head is stale if the acceptance-critical summary provides final validation evidence.
 
 ## state.md
 ${state || "not available"}
@@ -577,6 +810,80 @@ function sanitizeProviderError(error: unknown, max = 1200): string {
 	return truncate(raw.replace(/\s+$/g, ""), max);
 }
 
+function isToolProtocolProviderError(text: string): boolean {
+	return /messages\s+with\s+role\s+['"]?tool['"]?\s+must\s+be\s+a\s+response\s+to\s+a\s+preceding\s+message\s+with\s+['"]?tool_calls['"]?/i.test(text);
+}
+
+function assistantErrorText(messages: any[]): string {
+	return messages
+		.filter((message) => message?.role === "assistant" && typeof message.errorMessage === "string")
+		.map((message) => sanitizeProviderError(message.errorMessage, 1200))
+		.join("\n");
+}
+
+function toolCallIdsFromAssistant(message: any): string[] {
+	if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return [];
+	return message.content
+		.filter((part: any) => part?.type === "toolCall" && typeof part.id === "string" && part.id)
+		.map((part: any) => part.id);
+}
+
+function sanitizeToolProtocolContext(messages: any[]): { messages: any[]; removed: number } {
+	const sanitized: any[] = [];
+	let pendingToolCallIds = new Set<string>();
+	let removed = 0;
+	for (const message of messages) {
+		if (message?.role === "assistant") {
+			sanitized.push(message);
+			pendingToolCallIds = new Set(toolCallIdsFromAssistant(message));
+			continue;
+		}
+		if (message?.role === "toolResult") {
+			const id = typeof message.toolCallId === "string" ? message.toolCallId : "";
+			if (id && pendingToolCallIds.has(id)) {
+				sanitized.push(message);
+				pendingToolCallIds.delete(id);
+			} else {
+				removed += 1;
+			}
+			continue;
+		}
+		if (message?.role === "user") pendingToolCallIds = new Set();
+		sanitized.push(message);
+	}
+	return { messages: sanitized, removed };
+}
+
+function sanitizeProviderToolPayload(payload: unknown): { payload: unknown; removed: number } {
+	if (!payload || typeof payload !== "object") return { payload, removed: 0 };
+	const source = payload as { messages?: any[] };
+	if (!Array.isArray(source.messages)) return { payload, removed: 0 };
+	const messages: any[] = [];
+	let pendingToolCallIds = new Set<string>();
+	let removed = 0;
+	for (const message of source.messages) {
+		if (message?.role === "assistant") {
+			messages.push(message);
+			const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+			pendingToolCallIds = new Set(calls.map((call: any) => (typeof call?.id === "string" ? call.id : "")).filter(Boolean));
+			continue;
+		}
+		if (message?.role === "tool") {
+			const id = typeof message.tool_call_id === "string" ? message.tool_call_id : "";
+			if (id && pendingToolCallIds.has(id)) {
+				messages.push(message);
+				pendingToolCallIds.delete(id);
+			} else {
+				removed += 1;
+			}
+			continue;
+		}
+		if (message?.role === "user" || message?.role === "system" || message?.role === "developer") pendingToolCallIds = new Set();
+		messages.push(message);
+	}
+	return removed > 0 ? { payload: { ...source, messages }, removed } : { payload, removed: 0 };
+}
+
 function sanitizeAssistantErrorInPlace(message: any): void {
 	if (!message || message.role !== "assistant") return;
 	if (typeof message.errorMessage === "string") {
@@ -611,6 +918,16 @@ function assistantText(messages: any[]): string {
 		.map((message) => textFromContent(message.content))
 		.filter(Boolean)
 		.join("\n\n");
+}
+
+function finalAssistantText(messages: any[]): string {
+	for (let i = messages.length - 1; i >= 0; i -= 1) {
+		const message = messages[i];
+		if (message?.role !== "assistant") continue;
+		const text = textFromContent(message.content).trim();
+		if (text) return text;
+	}
+	return "";
 }
 
 function transcriptFromMessages(messages: any[]): string {
@@ -692,9 +1009,32 @@ function newLedger(run: AwRun): Ledger {
 	};
 }
 
+function normalizeLedger(run: AwRun, parsed: unknown): Ledger {
+	const fresh = newLedger(run);
+	if (Array.isArray(parsed)) {
+		return { ...fresh, legacy_events: parsed };
+	}
+	if (!parsed || typeof parsed !== "object") return fresh;
+	const source = parsed as Partial<Ledger>;
+	const totals = source.totals && typeof source.totals === "object" && !Array.isArray(source.totals) ? source.totals : {};
+	return {
+		...fresh,
+		...source,
+		task_id: typeof source.task_id === "string" ? source.task_id : fresh.task_id,
+		task_title: typeof source.task_title === "string" ? source.task_title : fresh.task_title,
+		artifact_dir: typeof source.artifact_dir === "string" ? source.artifact_dir : fresh.artifact_dir,
+		started_at: typeof source.started_at === "string" ? source.started_at : fresh.started_at,
+		config: source.config && typeof source.config === "object" ? source.config : fresh.config,
+		totals: totals as Record<string, UsageTotals>,
+		steps: Array.isArray(source.steps) ? source.steps : [],
+		compactions: Array.isArray(source.compactions) ? source.compactions : [],
+		legacy_events: Array.isArray(source.legacy_events) ? source.legacy_events : undefined,
+	};
+}
+
 async function readLedger(run: AwRun): Promise<Ledger> {
 	try {
-		return JSON.parse(await readFile(ledgerPath(run), "utf8")) as Ledger;
+		return normalizeLedger(run, JSON.parse(await readFile(ledgerPath(run), "utf8")));
 	} catch {
 		return newLedger(run);
 	}
@@ -712,11 +1052,22 @@ async function appendCompaction(run: AwRun, compaction: LedgerCompaction): Promi
 	await writeLedger(run, ledger);
 }
 
-function makeTextTable(rows: string[][], align: ("left" | "right")[] = []): string {
-	const widths = rows[0]?.map((_, col) => Math.max(...rows.map((row) => row[col]?.length ?? 0))) ?? [];
-	return rows
+function makeTextTable(rows: unknown[][], align: ("left" | "right")[] = []): string {
+	const safeRows = rows.map((row) => row.map((cell) => (cell === null || cell === undefined ? "" : String(cell))));
+	const widths = safeRows[0]?.map((_, col) => Math.max(...safeRows.map((row) => row[col]?.length ?? 0))) ?? [];
+	return safeRows
 		.map((row) => row.map((cell, col) => (align[col] === "right" ? cell.padStart(widths[col]) : cell.padEnd(widths[col]))).join("  ").trimEnd())
 		.join("\n");
+}
+
+function normalizedUsage(value: Partial<UsageTotals> | undefined): UsageTotals {
+	return {
+		in: Number(value?.in ?? 0) || 0,
+		out: Number(value?.out ?? 0) || 0,
+		cache_read: Number(value?.cache_read ?? 0) || 0,
+		cache_write: Number(value?.cache_write ?? 0) || 0,
+		cost: Number(value?.cost ?? 0) || 0,
+	};
 }
 
 function formatRole(role: Role | "TOTAL" | "UNKNOWN"): string {
@@ -730,14 +1081,17 @@ function formatLedgerTokenTotals(ledger: Ledger): string {
 	const steps = ledger.steps ?? [];
 	const rows = new Map<string, { role: Role | "UNKNOWN"; model: string; usage: UsageTotals }>();
 	if (steps.length > 0) {
-		for (const step of steps) {
-			const key = `${step.role}\u0000${step.model}`;
-			const current = rows.get(key) ?? { role: step.role, model: step.model, usage: { in: 0, out: 0, cache_read: 0, cache_write: 0, cost: 0 } };
-			current.usage = addUsage(current.usage, step);
+		for (const step of steps as any[]) {
+			const model = typeof step?.model === "string" && step.model ? step.model : "unknown-model";
+			const roleText = typeof step?.role === "string" ? step.role.toUpperCase() : "UNKNOWN";
+			const role: Role | "UNKNOWN" = roleText === "ANALYST" || roleText === "WORKER" ? roleText : "UNKNOWN";
+			const key = `${role}\u0000${model}`;
+			const current = rows.get(key) ?? { role, model, usage: { in: 0, out: 0, cache_read: 0, cache_write: 0, cost: 0 } };
+			current.usage = addUsage(current.usage, normalizedUsage(step));
 			rows.set(key, current);
 		}
 	} else {
-		for (const [model, usage] of Object.entries(ledger.totals ?? {})) rows.set(`UNKNOWN\u0000${model}`, { role: "UNKNOWN", model, usage });
+		for (const [model, usage] of Object.entries(ledger.totals ?? {})) rows.set(`UNKNOWN\u0000${model}`, { role: "UNKNOWN", model, usage: normalizedUsage(usage) });
 	}
 	const entries = Array.from(rows.values()).sort((a, b) => {
 		const roleOrder = (role: Role | "UNKNOWN") => (role === "ANALYST" ? 0 : role === "WORKER" ? 1 : 2);
@@ -791,10 +1145,11 @@ function formatStepSummary(turn: ActiveTurn, usage: UsageTotals, timing: StepTim
 		["Wall", formatDuration(timing.wall_ms)],
 		["LLM/orchestration", formatDuration(timing.llm_ms)],
 		["Tools/experiments", timing.tool_ms > 0 ? formatDuration(timing.tool_ms) : "–"],
-		...(timing.external_ms > 0 ? [["External analyst subprocess", formatDuration(timing.external_ms)]] : []),
+		...(timing.external_ms > 0 ? [[turn.externalWorker ? "External worker subprocess" : "External analyst subprocess", formatDuration(timing.external_ms)]] : []),
 	];
 	const finalTotals = stateAfter === "DONE_NEEDS_OPERATOR_CONFIRMATION" ? `\n\nTime totals\n${ledgerTimingSummary(ledger)}\n\nRecommended archive action\n  /analyst-worker archive --keep-tmp` : "";
-	return `Step summary\n${makeTextTable(stepRows, ["right", "left", "left", "left", "left", "left"])}\n\nStep usage\n${makeTextTable(usageRows, ["right", "right", "right", "right", "right"])}\n\nStep time\n${makeTextTable(timeRows, ["left", "right"])}\n\nToken totals\n${formatLedgerTokenTotals(ledger)}${finalTotals}\n\nReport\n  ${reportPath}`;
+	const runtimeLogs = (turn.externalLogDirs ?? []).length ? `\n\nRuntime logs (not archive records)\n${(turn.externalLogDirs ?? []).map((dir) => `  ${dir}`).join("\n")}` : "";
+	return `Step summary\n${makeTextTable(stepRows, ["right", "left", "left", "left", "left", "left"])}\n\nStep usage\n${makeTextTable(usageRows, ["right", "right", "right", "right", "right"])}\n\nStep time\n${makeTextTable(timeRows, ["left", "right"])}\n\nToken totals\n${formatLedgerTokenTotals(ledger)}${finalTotals}\n\nReport\n  ${reportPath}${runtimeLogs}`;
 }
 
 function escapeRegex(text: string): string {
@@ -1028,6 +1383,10 @@ function stateMarkdown(run: AwRun): string {
 		.filter(Boolean)
 		.map((p) => `- ${p}`)
 		.join("\n");
+	const operatorNotes = (run.operatorNotes ?? [])
+		.slice(-8)
+		.map((note) => `### ${note.timestamp}\n${note.text}`)
+		.join("\n\n");
 	return `# Analyst/Worker State
 
 Task: ${run.config.taskTitle}
@@ -1051,8 +1410,23 @@ Autonomous runtime checkpoint: ${formatHours(run.config.maxAutonomousHours ?? DE
 Autonomous runtime started: ${run.autonomousStartedAt ?? run.config.startedAt}
 Autonomous worker steps since operator: ${run.workerStepsSinceOperator ?? 0}
 
-## Global task description
-${run.config.taskDescription || run.config.taskTitle}
+## Current authorized worker instruction
+Instruction id: ${run.authorizedInstructionId ?? "none"}
+${run.recoveryWorkerInstruction ? `\nRecovery instruction override:\n${run.recoveryWorkerInstruction}\n` : ""}
+Last completed worker instruction id: ${run.lastCompletedWorkerInstructionId ?? "none"}
+Last completed worker step: ${run.lastCompletedWorkerStep ? stepId(run.lastCompletedWorkerStep) : "none"}
+
+## Operator notes / decisions
+${operatorNotes || "- None recorded."}
+
+## Next action
+${run.nextAction || "Run /analyst-worker."}
+
+## Operator expected?
+${run.operatorExpected || "No."}
+
+## Latest artifacts
+${latestArtifacts || "- None yet."}
 
 ## Current hypothesis
 ${run.currentHypothesis || "TBD by analyst."}
@@ -1063,14 +1437,8 @@ ${run.done.length ? run.done.map((item) => `- ${item}`).join("\n") : "- Nothing 
 ## Open questions
 ${run.openQuestions.length ? run.openQuestions.map((item) => `- ${item}`).join("\n") : "- None recorded yet."}
 
-## Next action
-${run.nextAction || "Run /analyst-worker."}
-
-## Operator expected?
-${run.operatorExpected || "No."}
-
-## Latest artifacts
-${latestArtifacts || "- None yet."}
+## Global task description
+${run.config.taskDescription || run.config.taskTitle}
 `;
 }
 
@@ -1114,7 +1482,10 @@ function formatTiming(timing: StepTiming): string {
 	return `Wall: ${formatDuration(timing.wall_ms)}, LLM/orchestration: ${formatDuration(timing.llm_ms)}, tools/experiments: ${formatDuration(timing.tool_ms)}${timing.external_ms ? `, external subprocess: ${formatDuration(timing.external_ms)}` : ""}${tools ? `, tool calls: ${tools}` : ""}${timing.tool_errors ? `, tool errors: ${timing.tool_errors}` : ""}`;
 }
 
-function stepReportMarkdown(turn: ActiveTurn, run: AwRun, usage: UsageTotals, stateAfter: AwStateName, transcript: string, timing: StepTiming): string {
+function stepReportMarkdown(turn: ActiveTurn, run: AwRun, usage: UsageTotals, stateAfter: AwStateName, transcript: string, timing: StepTiming, finalText = ""): string {
+	const finalAnswer = finalText.trim()
+		? `\n## Acceptance-critical final answer\n\nInstruction id: ${turn.authorizedInstructionId ?? "none"}\n\nThis section is copied from the last substantive assistant message before the raw transcript. External/proxy-safe analyst reviews must prioritize it over stale or truncated raw transcript fragments.\n\n${truncate(finalText.trim(), 18000)}\n`
+		: "";
 	return `# Analyst/Worker Step Report
 
 Role: ${turn.role}
@@ -1122,6 +1493,11 @@ Phase: ${turn.phase}
 Step: ${turn.step}
 Model: ${turn.model}
 Thinking level: ${turn.thinkingLevel}
+Authorized instruction id: ${turn.authorizedInstructionId ?? "none"}
+External worker subprocess: ${turn.externalWorker ? "yes" : "no"}
+External subprocess attempts: ${turn.externalAttempts ?? 0}
+External runtime logs: ${(turn.externalLogDirs ?? []).join(", ") || "none"}
+Sanitized orphan tool results from provider context: ${turn.contextSanitizedToolResults ?? 0}
 Started: ${turn.startedAt}
 Finished: ${run.updatedAt}
 State after: ${stateAfter}
@@ -1137,7 +1513,7 @@ Output: ${usage.out}
 Cache read: ${usage.cache_read}
 Cache write: ${usage.cache_write}
 Cost: ${formatMoney(usage.cost)}
-
+${finalAnswer}
 ## Assistant/tool transcript
 
 ${transcript || "No assistant text captured."}
@@ -1156,12 +1532,94 @@ function operatorMessage(run: AwRun, reason: string, expected: string): string {
 }
 
 function parseAnalystNextState(text: string): "NEEDS_WORKER" | "NEEDS_OPERATOR" | "DONE" | "ABORT" | undefined {
-	const nextStateLine = text.match(/(?:^|\n)\s*##?\s*Next state\s*\n([\s\S]{0,200})/i)?.[1] ?? text;
-	if (/\bABORT\b/i.test(nextStateLine)) return "ABORT";
-	if (/\bDONE\b/i.test(nextStateLine)) return "DONE";
-	if (/\bNEEDS_OPERATOR\b|\bBLOCKED\b|OPERATOR ACTION REQUIRED/i.test(nextStateLine)) return "NEEDS_OPERATOR";
-	if (/\bNEEDS_WORKER\b|\bMORE_WORK\b/i.test(nextStateLine)) return "NEEDS_WORKER";
-	return undefined;
+	const stateFromToken = (token: string): "NEEDS_WORKER" | "NEEDS_OPERATOR" | "DONE" | "ABORT" | undefined => {
+		if (/^ABORT$/i.test(token)) return "ABORT";
+		if (/^DONE$/i.test(token)) return "DONE";
+		if (/^(NEEDS_OPERATOR|BLOCKED)$/i.test(token)) return "NEEDS_OPERATOR";
+		if (/^(NEEDS_WORKER|MORE_WORK)$/i.test(token)) return "NEEDS_WORKER";
+		return undefined;
+	};
+	const section = text.match(/(?:^|\n)\s*(?:#{1,3}\s*)?Next state\s*:?\s*\n([\s\S]*?)(?=\n\s*(?:#{1,3}\s*)?(?:Operator handoff|Diagnosis \/ Review|Hypothesis|Worker instruction|Validation \/ Risks|Operational memory)\s*:?\s*\n|$)/i)?.[1];
+	if (section) {
+		for (const line of section.split(/\r?\n/)) {
+			const token = line
+				.replace(/^[\s>*_`#\-:]+|[\s>*_`#\-:.]+$/g, "")
+				.match(/\b(ABORT|DONE|NEEDS_OPERATOR|BLOCKED|NEEDS_WORKER|MORE_WORK)\b/i)?.[1];
+			const state = token ? stateFromToken(token) : undefined;
+			if (state) return state;
+		}
+	}
+	const inline = text.match(/(?:^|\n)\s*(?:#{1,3}\s*)?Next state\s*:\s*(ABORT|DONE|NEEDS_OPERATOR|BLOCKED|NEEDS_WORKER|MORE_WORK)\b/i)?.[1];
+	return inline ? stateFromToken(inline) : undefined;
+}
+
+function instructionIdForAnalystTurn(turn: ActiveTurn, analystText: string): string {
+	const workerInstruction = extractNamedSection(analystText, ["Worker instruction"], 1200);
+	const firstLine = workerInstruction
+		.split(/\r?\n/)
+		.map((line) => line.replace(/^[#\s>*_`-]+/, "").trim())
+		.find(Boolean);
+	return `${stepId(turn.step)}_${slugify(firstLine || phaseLabel(turn.phase))}`.slice(0, 96);
+}
+
+function isReconciliationInstructionId(instructionId?: string): boolean {
+	return typeof instructionId === "string" && /auto[_-]?reconcile|reconciliation|reconcile/i.test(instructionId);
+}
+
+function analystSaysReconciliationResolved(text: string): boolean {
+	return /(?:reconciliation|audit).{0,120}(?:accepted|complete|completed|resolved|clean|unchanged)|(?:accepted|complete|completed|resolved|clean|unchanged).{0,120}(?:reconciliation|audit)/is.test(text);
+}
+
+function analystRequiresOperatorDecision(text: string): boolean {
+	return /operator (?:approval|decision|handoff)|pending operator approval|requires? .*operator approval|please choose|choose one|no worker instruction (?:is )?(?:currently )?authorized|no worker instruction is currently authorized/i.test(text);
+}
+
+function shouldAutoReconcileFromAnalyst(text: string, lastCompletedWorkerInstructionId?: string): boolean {
+	const lower = text.toLowerCase();
+	const evidenceProblem = /(contradictory|contradiction|truncated|not reviewable|incomplete|stale|mixed|ambiguous|malformed|corrupted|omitted|insufficient).{0,140}(report|context|evidence|transcript|final answer|summary)|(?:report|context|evidence|transcript|final answer|summary).{0,140}(contradictory|truncated|not reviewable|incomplete|stale|mixed|ambiguous|malformed|corrupted|omitted|insufficient)|missing.{0,80}(validation|evidence|final implementation summary|visible report)/is.test(lower);
+	const readOnlyAudit = /read-only.{0,80}(reconciliation|audit|status)|(?:reconciliation|audit|status).{0,80}read-only|reconciliation\s*\/\s*status|status worker check|inspect.{0,80}(worktree|artifact)/is.test(lower);
+	const humanOnly = /credentials|secret|payment|delete|destructive|legal|manual inspection only|pause\/abort/i.test(text);
+	const alreadyReviewedReconciliation = isReconciliationInstructionId(lastCompletedWorkerInstructionId);
+	const resolved = analystSaysReconciliationResolved(text);
+	const operatorDecision = analystRequiresOperatorDecision(text);
+	const loopWarning = /(?:loop|repeated|again|wasteful).{0,120}(?:reconciliation|audit)|(?:reconciliation|audit).{0,120}(?:loop|repeated|again|wasteful)|future runs should not trigger another reconciliation/i.test(text);
+
+	// Auto-reconciliation is a one-shot recovery from unsafe/stale evidence, not a
+	// substitute for an operator decision after a completed audit. Once the latest
+	// worker was itself a reconciliation pass, any NEEDS_OPERATOR review must block
+	// instead of dispatching another identical read-only audit.
+	if (alreadyReviewedReconciliation) return false;
+	if (resolved && operatorDecision) return false;
+	if (loopWarning) return false;
+	return evidenceProblem && readOnlyAudit && !humanOnly;
+}
+
+function automaticReconciliationInstruction(analystText: string): string {
+	const proposed = extractNamedSection(analystText, ["Worker instruction"], 4000);
+	return `Automatic recovery: perform one read-only reconciliation audit because the analyst found stale/truncated/contradictory embedded evidence. This is a one-shot recovery: do not re-run the same reconciliation if the answer is unchanged. Do not edit source and do not start the next implementation stage. Inspect the latest official analyst/worker reports, git status/diff summary, and the files/artifacts named by the analyst. Run only lightweight read-only checks and focused validation commands that are already known safe. Write a compact report with: trusted latest stage, files changed/touched, validation evidence, whether the previous stage is accepted, whether any later stage was started, and the exact next recommended bounded worker instruction.\n\nAnalyst-proposed audit details:\n${proposed || truncate(analystText, 2500)}`;
+}
+
+function workerReportLooksComplete(text: string): boolean {
+	const section = (name: string) => new RegExp(`(?:^|\\n)\\s*(?:#{1,3}\\s*)?${escapeRegex(name)}\\b`, "i");
+	const required = [
+		section("Task understood"),
+		section("Actions taken"),
+		section("Result"),
+		section("Validation"),
+		/(?:^|\n)\s*(?:#{1,3}\s*)?Diff\s*\/\s*artifacts\b/i,
+		/(?:^|\n)\s*(?:#{1,3}\s*)?Issues\s*\/\s*risks\s*\/\s*lessons\b/i,
+		/(?:^|\n)\s*(?:#{1,3}\s*)?Worker recommendation\s*\/\s*next steps\b/i,
+		/(?:^|\n)\s*(?:#{1,3}\s*)?Stop\s*\/\s*handoff\b/i,
+	];
+	return required.every((pattern) => pattern.test(text));
+}
+
+function workerExplicitlyNeedsOperator(text: string): boolean {
+	return /\b(awaiting|needs?|requires?)\s+operator\b|\boperator\s+(?:decision|authorization|approval|required)\b|\bmissing credentials\b|\bcannot continue\b|\bblocked\b/i.test(text);
+}
+
+function incompleteWorkerContinuationInstruction(turn: ActiveTurn): string {
+	return `Automatic recovery: the previous worker turn for instruction ${turn.authorizedInstructionId ?? "unknown"} ended without the required final Worker report sections, so the Analyst would not have acceptance evidence. Continue the SAME bounded instruction only. Inspect the current worktree and artifact directory, complete any unfinished deliverables from that instruction, run the required build/tests/policy checks, write the requested audit/prompt artifacts, and finish with all required Worker report sections. Do not start a new implementation stage beyond the current authorized instruction.`;
 }
 
 function createRun(ctx: ExtensionCommandContext, config: Omit<AwConfig, "cwd" | "taskSlug" | "taskId" | "startedAt">): AwRun {
@@ -1187,6 +1645,11 @@ function createRun(ctx: ExtensionCommandContext, config: Omit<AwConfig, "cwd" | 
 		openQuestions: [],
 		nextAction: "Run /analyst-worker to ask the analyst for the initial plan.",
 		operatorExpected: "No: analyst planning starts automatically.",
+		operatorNotes: [],
+		authorizedInstructionId: undefined,
+		recoveryWorkerInstruction: undefined,
+		lastCompletedWorkerInstructionId: undefined,
+		lastCompletedWorkerStep: undefined,
 		operatorModel: ctx.model ? modelRef(ctx.model) : undefined,
 		workerStepsSinceOperator: 0,
 		autonomousStartedAt: startedAt,
@@ -1508,6 +1971,10 @@ function buildRolePrompt(run: AwRun, turn: ActiveTurn): string {
 	const ledger = displayPath(ledgerPath(run), run.config.cwd);
 	const artifacts = displayPath(artifactDir(run), run.config.cwd);
 	const lastReport = run.lastReportPath ? run.lastReportPath : "none yet";
+	const operatorNotes = (run.operatorNotes ?? [])
+		.slice(-5)
+		.map((note) => `- ${note.timestamp}: ${note.text.replace(/\s+/g, " ").trim()}`)
+		.join("\n");
 	const common = `${header}
 
 Workflow files:
@@ -1515,6 +1982,15 @@ Workflow files:
 - Ledger: ${ledger}
 - Artifact dir: ${artifacts}
 - Latest report: ${lastReport}
+
+Current authorized worker instruction:
+Instruction id: ${run.authorizedInstructionId ?? "none"}
+${run.recoveryWorkerInstruction ? `\nRecovery instruction override (takes precedence over stale transcript):\n${run.recoveryWorkerInstruction}\n` : ""}
+Last completed worker instruction id: ${run.lastCompletedWorkerInstructionId ?? "none"}
+Last completed worker step: ${run.lastCompletedWorkerStep ? stepId(run.lastCompletedWorkerStep) : "none"}
+
+Recent operator notes / decisions:
+${operatorNotes || "- None recorded."}
 
 Global task description:
 ${run.config.taskDescription || run.config.taskTitle}
@@ -1552,7 +2028,9 @@ When handing off or declaring DONE, include an operations reflection: time/token
 	if (turn.phase === "WORKER_RUN") {
 		return `${common}
 [WORKER MODE]
-Execute exactly one bounded task from the latest ANALYST worker instruction. Do not continue into a second task. Put logs/scratch files under ${artifacts}.
+Execute exactly one bounded task from the current authorized instruction. If a recovery instruction override is present above, execute that override instead of any stale transcript instruction. Do not continue into a second task. Put logs/scratch files under ${artifacts}.
+
+In your report, include the current Instruction id exactly as shown above.
 
 Required sections:
 ## Task understood
@@ -1570,6 +2048,10 @@ Always list failed commands, retries, surprising results, benchmark noise/varian
 	return `${common}
 [ANALYST REVIEW MODE]
 Review the latest worker result, update the high-level plan, and decide the next state. If more work is needed, produce exactly one next detailed worker stage. Ask the operator only when the result is done, blocked, ambiguous, risky, contradictory, or needs a human trade-off.
+
+If the last completed worker instruction was an automatic recovery reconciliation audit and you accept or resolve it, do not request another reconciliation audit. Set Next state to NEEDS_OPERATOR only when the next real stage lacks operator authorization.
+
+Normal read-only discovery/contract/planning stages are allowed inside an autonomous implementation workflow. Do not stop merely because the previous bounded stage was read-only; continue with NEEDS_WORKER when the next implementation stage is clear, bounded, safe, and within the operator's original task.
 
 Required sections:
 ## Diagnosis / Review
@@ -1624,6 +2106,10 @@ async function nextArchiveDir(run: AwRun): Promise<string> {
 export default function analystWorkerExtension(pi: ExtensionAPI) {
 	let run: AwRun | undefined;
 	let activeTurn: ActiveTurn | undefined;
+	let consecutiveWorkerToolProtocolFailures = 0;
+	let consecutiveIncompleteWorkerReports = 0;
+	let consecutiveCompactionFailures = 0;
+	let forceExternalWorkerOnce = false;
 	const validatedModels = new Set<string>();
 	const activeToolStarts = new Map<string, { started: number; step: number; toolName: string }>();
 
@@ -1646,6 +2132,22 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 
 	function sendMessage(content: string, details?: unknown): void {
 		pi.sendMessage({ customType: CUSTOM_MESSAGE, content, display: true, details });
+	}
+
+	async function recordOperatorNote(ctx: ExtensionContext, text: string): Promise<void> {
+		if (!run) return;
+		const trimmed = text.trim();
+		if (!trimmed) return;
+		run.operatorNotes = [...(run.operatorNotes ?? []), { timestamp: nowIso(), text: trimmed }].slice(-20);
+		run.workerStepsSinceOperator = 0;
+		run.autonomousStartedAt = nowIso();
+		if (run.state === "BLOCKED_NEEDS_OPERATOR" || run.state === "WAITING_FOR_OPERATOR") {
+			run.nextPhase = "ANALYST_PLAN";
+			run.nextRole = "ANALYST";
+		}
+		run.nextAction = "Operator note recorded. Analyst will review it before deciding the next worker stage.";
+		run.operatorExpected = "No: operator input has been recorded.";
+		await saveRun(ctx);
 	}
 
 	function beginWork(ctx: ExtensionContext, message: string, details?: unknown): () => void {
@@ -1746,6 +2248,11 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		}
 		run = restored;
 		if (run && typeof run.workerStepsSinceOperator !== "number") run.workerStepsSinceOperator = 0;
+		if (run && !Array.isArray(run.operatorNotes)) run.operatorNotes = [];
+		if (run && typeof run.authorizedInstructionId !== "string") run.authorizedInstructionId = undefined;
+		if (run && typeof run.recoveryWorkerInstruction !== "string") run.recoveryWorkerInstruction = undefined;
+		if (run && typeof run.lastCompletedWorkerInstructionId !== "string") run.lastCompletedWorkerInstructionId = undefined;
+		if (run && typeof run.lastCompletedWorkerStep !== "number") run.lastCompletedWorkerStep = undefined;
 		if (run && !run.config.maxAutonomousHours) run.config.maxAutonomousHours = DEFAULT_MAX_AUTONOMOUS_HOURS;
 		if (run && !run.autonomousStartedAt) run.autonomousStartedAt = run.config.startedAt;
 		updateStatus(ctx);
@@ -1803,6 +2310,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 				endWork();
 				void (async () => {
 					if (!run) return;
+					consecutiveCompactionFailures = 0;
 					await appendCompaction(run, {
 						started_at: compactionStartedAt,
 						finished_at: nowIso(),
@@ -1820,6 +2328,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 				endWork();
 				void (async () => {
 					if (!run) return;
+					const sanitized = sanitizeProviderError(error, 1200);
 					await appendCompaction(run, {
 						started_at: compactionStartedAt,
 						finished_at: nowIso(),
@@ -1828,17 +2337,36 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 						wall_ms: Date.now() - compactionStartedMs,
 						tokens_before: usage.tokens ?? null,
 						status: "failed",
-						error: sanitizeProviderError(error, 1200),
+						error: sanitized,
 					});
+					if (isExternalTransportError(sanitized) && consecutiveCompactionFailures < 1) {
+						consecutiveCompactionFailures += 1;
+						run.state = "BLOCKED_NEEDS_OPERATOR";
+						run.nextRole = role;
+						run.nextPhase = phase;
+						run.nextAction = "Context compaction hit a transient transport error; retrying compaction once automatically.";
+						run.operatorExpected = "No: automatic compaction retry is in progress.";
+						await saveRun(ctx);
+						sendMessage(`[SYSTEM]\nCompaction transport error; retrying once automatically.\nError: ${sanitized}`, { type: "context-compaction-retry" });
+						await startRoleTurn(ctx, phase, true);
+						return;
+					}
+					consecutiveCompactionFailures = 0;
+					run.state = "BLOCKED_NEEDS_OPERATOR";
+					run.nextRole = role;
+					run.nextPhase = phase;
+					run.nextAction = `Context compaction failed before ${phaseLabel(phase)}: ${sanitized}`;
+					run.operatorExpected = "Yes: retry with /analyst-worker, reduce/reset context, switch model/provider, or reauthenticate.";
+					await saveRun(ctx);
+					sendMessage(
+						operatorMessage(
+							run,
+							`Compaction failed: ${sanitized}`,
+							"Retry with /analyst-worker, reduce/reset context, switch model/provider, or reauthenticate.",
+						),
+						{ type: "model-probe-failed" },
+					);
 				})();
-				sendMessage(
-					operatorMessage(
-						run!,
-						`Compaction failed: ${sanitizeProviderError(error, 1200)}`,
-						"Resolve context manually, switch/reauthenticate the analyst model, or raise context limits, then run /analyst-worker.",
-					),
-					{ type: "model-probe-failed" },
-				);
 			},
 		});
 		return true;
@@ -1907,6 +2435,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			stateAtStart: run.state,
 			startedAt: nowIso(),
 			auto,
+			authorizedInstructionId: run.authorizedInstructionId,
 			toolMs: 0,
 			toolMsByName: {},
 			toolCounts: {},
@@ -1925,6 +2454,19 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			return;
 		}
 
+		if (role === "WORKER" && forceExternalWorkerOnce) {
+			forceExternalWorkerOnce = false;
+			activeTurn.externalWorker = true;
+			try {
+				await runExternalWorkerTurn(ctx, activeTurn);
+			} catch (error) {
+				if (!run || !activeTurn) return;
+				const message = syntheticAssistantMessage(ref, "", sanitizeProviderError(error));
+				await finishTurn({ type: "agent_end", messages: [message] } as AgentEndEvent, ctx);
+			}
+			return;
+		}
+
 		const prompt = buildRolePrompt(run, activeTurn);
 		if (ctx.isIdle()) pi.sendUserMessage(prompt);
 		else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
@@ -1933,22 +2475,69 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 	async function runExternalAnalystTurn(ctx: ExtensionContext, turn: ActiveTurn): Promise<void> {
 		if (!run) return;
 		const prompt = await buildExternalAnalystPrompt(run, turn);
+		const logRoot = runtimeLogRoot(run);
 		sendMessage(
-			`${turnHeader(run, turn)}\nAction: analyst review running\nModel: ${turn.model}\nThinking: ${turn.thinkingLevel}`,
-			{ type: "external-analyst-start", turn },
+			`${turnHeader(run, turn)}\nAction: analyst review running\nModel: ${turn.model}\nThinking: ${turn.thinkingLevel}\nRuntime logs: ${logRoot}`,
+			{ type: "external-analyst-start", turn, logRoot },
 		);
-		const endWork = beginWork(ctx, `Running analyst ${turn.model} (${turn.thinkingLevel} thinking)...`, { role: turn.role, model: turn.model, thinkingLevel: turn.thinkingLevel, step: turn.step });
+		const retryLimit = Math.max(0, Math.floor(asPositiveNumber(process.env.PI_ANALYST_WORKER_EXTERNAL_ANALYST_RETRIES, 1)));
+		const endWork = beginWork(ctx, `Running analyst ${turn.model} (${turn.thinkingLevel} thinking)...`, { role: turn.role, model: turn.model, thinkingLevel: turn.thinkingLevel, step: turn.step, logRoot });
+		let result: Awaited<ReturnType<typeof runQuickPiPrompt>> | undefined;
+		try {
+			for (let attempt = 1; attempt <= retryLimit + 1; attempt += 1) {
+				turn.externalAttempts = attempt;
+				result = await runQuickPiPrompt(pi, ctx, turn.model, turn.thinkingLevel, ANALYST_SYSTEM, prompt, 180000, {
+					log: { dir: logRoot, label: "external_analyst", attempt, role: turn.role, phase: turn.phase, step: turn.step },
+				});
+				if (result.logDir) turn.externalLogDirs = [...(turn.externalLogDirs ?? []), result.logDir];
+				turn.externalMs += result.wallMs;
+				if (result.ok || attempt > retryLimit || !isExternalTransportError(result.error)) break;
+				sendMessage(
+					`${turnHeader(run, turn)}\nAction: analyst subprocess transport error; retrying automatically (${attempt}/${retryLimit})\nError: ${result.error}\nRuntime log: ${result.logDir ?? logRoot}`,
+					{ type: "external-analyst-retry", turn, attempt, retryLimit, error: result.error, logDir: result.logDir },
+				);
+			}
+		} finally {
+			endWork();
+		}
+		if (!run || activeTurn !== turn || !result) return;
+		if (result.ok) {
+			const text = result.text.trim();
+			sendMessage(`${turnHeader(run, turn)}\n\n${text}`, { type: "external-analyst-output", turn });
+			await finishTurn({ type: "agent_end", messages: [syntheticAssistantMessage(turn.model, text, undefined, result.usage)] } as AgentEndEvent, ctx);
+		} else {
+			const error = `${result.error}${result.logDir ? `\nRuntime log: ${result.logDir}` : ""}`;
+			sendMessage(`${turnHeader(run, turn)}\n\nError: ${error}`, { type: "model-probe-failed", role: turn.role, model: turn.model, error, logDir: result.logDir });
+			await finishTurn({ type: "agent_end", messages: [syntheticAssistantMessage(turn.model, "", error)] } as AgentEndEvent, ctx);
+		}
+	}
+
+	async function runExternalWorkerTurn(ctx: ExtensionContext, turn: ActiveTurn): Promise<void> {
+		if (!run) return;
+		const prompt = buildRolePrompt(run, turn);
+		const logRoot = runtimeLogRoot(run);
+		sendMessage(
+			`${turnHeader(run, turn)}\nAction: worker execution running in a clean subprocess after context/tool-message recovery\nModel: ${turn.model}\nThinking: ${turn.thinkingLevel}\nRuntime logs: ${logRoot}`,
+			{ type: "external-worker-start", turn, logRoot },
+		);
+		const timeoutMs = asPositiveNumber(process.env.PI_ANALYST_WORKER_EXTERNAL_WORKER_TIMEOUT_MS, 2 * 60 * 60 * 1000);
+		const endWork = beginWork(ctx, `Running worker ${turn.model} in a clean subprocess (${turn.thinkingLevel} thinking)...`, { role: turn.role, model: turn.model, thinkingLevel: turn.thinkingLevel, step: turn.step, logRoot });
 		let result: Awaited<ReturnType<typeof runQuickPiPrompt>>;
 		try {
-			result = await runQuickPiPrompt(pi, ctx, turn.model, turn.thinkingLevel, ANALYST_SYSTEM, prompt, 180000);
+			turn.externalAttempts = 1;
+			result = await runQuickPiPrompt(pi, ctx, turn.model, turn.thinkingLevel, WORKER_SYSTEM, prompt, timeoutMs, {
+				tools: true,
+				log: { dir: logRoot, label: "external_worker", attempt: 1, role: turn.role, phase: turn.phase, step: turn.step },
+			});
 		} finally {
 			endWork();
 		}
 		if (!run || activeTurn !== turn) return;
 		turn.externalMs += result.wallMs;
+		if (result.logDir) turn.externalLogDirs = [...(turn.externalLogDirs ?? []), result.logDir];
 		if (result.ok) {
 			const text = result.text.trim();
-			sendMessage(`${turnHeader(run, turn)}\n\n${text}`, { type: "external-analyst-output", turn });
+			sendMessage(`${turnHeader(run, turn)}\n\n${text}`, { type: "external-worker-output", turn });
 			await finishTurn({ type: "agent_end", messages: [syntheticAssistantMessage(turn.model, text, undefined, result.usage)] } as AgentEndEvent, ctx);
 		} else {
 			const error = result.error;
@@ -1968,6 +2557,14 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		const usage = usageFromMessages(messages);
 		const transcript = transcriptFromMessages(messages);
 		const text = assistantText(messages);
+		const finalText = finalAssistantText(messages);
+		const providerErrorText = assistantErrorText(messages);
+		const toolProtocolError = isToolProtocolProviderError(`${providerErrorText}\n${transcript}\n${text}`);
+		if (turn.role === "ANALYST" && !run.lastCompletedWorkerInstructionId) {
+			const recovered = await readWorkerInstructionIdFromReport(run);
+			run.lastCompletedWorkerInstructionId = recovered.instructionId;
+			run.lastCompletedWorkerStep = recovered.step;
+		}
 		let stateAfter: AwStateName = "WAITING_FOR_OPERATOR";
 		let nextPhase: Phase | null = "WORKER_RUN";
 		let nextRole: Role | null = "WORKER";
@@ -1980,6 +2577,8 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			nextPhase = null;
 			nextRole = null;
 			autoNextPhase = null;
+			run!.authorizedInstructionId = undefined;
+			run!.recoveryWorkerInstruction = undefined;
 			run!.nextAction = "Review completion summary, then run /analyst-worker finish or /analyst-worker archive.";
 			run!.operatorExpected = "Yes: confirm completion and choose archive action.";
 			expected = "Confirm completion with /analyst-worker finish or archive with /analyst-worker archive.";
@@ -1990,6 +2589,8 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			nextPhase = null;
 			nextRole = null;
 			autoNextPhase = null;
+			run!.authorizedInstructionId = undefined;
+			run!.recoveryWorkerInstruction = undefined;
 			run!.nextAction = "Workflow aborted by analyst recommendation.";
 			run!.operatorExpected = "Yes: inspect artifacts and decide cleanup.";
 			expected = "Inspect artifacts, then /analyst-worker archive --keep-tmp or cleanup manually.";
@@ -2000,6 +2601,8 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			nextPhase = "ANALYST_PLAN";
 			nextRole = "ANALYST";
 			autoNextPhase = null;
+			run!.authorizedInstructionId = undefined;
+			run!.recoveryWorkerInstruction = undefined;
 			run!.nextAction = "Operator input is required before another worker step.";
 			run!.operatorExpected = "Yes: answer the analyst question, then run /analyst-worker.";
 			expected = "Answer the analyst question, then run /analyst-worker.";
@@ -2011,9 +2614,26 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			nextRole = "WORKER";
 			autoNextPhase = "WORKER_RUN";
 			reason = why;
+			if (turn.role === "ANALYST") {
+				run!.authorizedInstructionId = instructionIdForAnalystTurn(turn, text);
+				run!.recoveryWorkerInstruction = undefined;
+			}
 			run!.nextAction = "Workflow is continuing automatically with the next worker stage.";
 			run!.operatorExpected = "No: worker executes the next bounded stage automatically.";
 			expected = "No operator action needed. Interrupt only if you need to steer.";
+		};
+
+		const continueWithAutomaticReconciliation = (why: string) => {
+			stateAfter = "WORKER_RUNNING";
+			nextPhase = "WORKER_RUN";
+			nextRole = "WORKER";
+			autoNextPhase = "WORKER_RUN";
+			reason = why;
+			run!.authorizedInstructionId = `${stepId(turn.step)}_auto_reconcile`;
+			run!.recoveryWorkerInstruction = automaticReconciliationInstruction(text);
+			run!.nextAction = "Workflow is automatically running a read-only reconciliation audit instead of blocking on contradictory/truncated embedded evidence.";
+			run!.operatorExpected = "No: a safe read-only reconciliation audit is running automatically.";
+			expected = "No operator action needed. Worker will perform a read-only reconciliation audit and report trusted state.";
 		};
 
 		const substantiveText = text.replace(turnHeader(run, turn), "").trim();
@@ -2029,20 +2649,71 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 				expected = "Switch/reauthenticate the analyst model or run /analyst-worker config, then continue.";
 			} else if (next === "DONE") stopDone();
 			else if (next === "ABORT") stopAbort();
+			else if (next === "NEEDS_OPERATOR" && shouldAutoReconcileFromAnalyst(text, run.lastCompletedWorkerInstructionId)) continueWithAutomaticReconciliation("analyst found contradictory/truncated evidence; starting safe read-only reconciliation audit automatically");
 			else if (next === "NEEDS_OPERATOR") stopNeedsOperator();
 			else continueWithWorker("analyst planned the first detailed worker stage; starting worker automatically");
 		}
 
 		if (turn.phase === "WORKER_RUN") {
-			run.workerStepsSinceOperator = (run.workerStepsSinceOperator ?? 0) + 1;
-			stateAfter = "ANALYST_REVIEWING";
-			nextPhase = "ANALYST_REVIEW";
-			nextRole = "ANALYST";
-			autoNextPhase = "ANALYST_REVIEW";
-			run.nextAction = "Workflow is continuing automatically with analyst review of the worker result.";
-			run.operatorExpected = "No: analyst review will run automatically.";
-			reason = "worker stage finished; starting analyst review automatically";
-			expected = "No operator action needed. Analyst will review and either plan the next stage or ask for help.";
+			if (toolProtocolError) {
+				consecutiveWorkerToolProtocolFailures += 1;
+				stateAfter = "WORKER_RUNNING";
+				nextPhase = "WORKER_RUN";
+				nextRole = "WORKER";
+				autoNextPhase = "WORKER_RUN";
+				if (consecutiveWorkerToolProtocolFailures === 1) {
+					reason = "worker provider rejected an orphaned tool-result message; sanitizing context and retrying the same worker stage automatically";
+					run.nextAction = "Workflow is retrying the same worker stage after removing invalid orphaned tool-result messages from the provider context.";
+					run.operatorExpected = "No: this is an automatic context-repair retry. Intervene only if it repeats.";
+					expected = "No operator action needed. The same worker instruction will be retried once with sanitized context.";
+				} else if (consecutiveWorkerToolProtocolFailures === 2) {
+					forceExternalWorkerOnce = true;
+					reason = "worker provider still rejected the main-session tool context; retrying once in a clean worker subprocess";
+					run.nextAction = "Workflow is retrying the same worker stage in a clean stateless worker subprocess with tools enabled.";
+					run.operatorExpected = "No: this is an automatic clean-context recovery. Intervene only if it fails again.";
+					expected = "No operator action needed. The same worker instruction will be retried once in a clean subprocess.";
+				} else {
+					stopNeedsOperator();
+					nextPhase = "WORKER_RUN";
+					nextRole = "WORKER";
+					run.nextAction = "Repeated worker provider tool-message protocol failures persisted after context sanitization and clean-subprocess recovery.";
+					run.operatorExpected = "Yes: switch worker model/provider, reset the Pi session context, or authorize a different recovery path.";
+					reason = "repeated worker provider tool-message protocol failure after automatic recoveries";
+					expected = "Switch worker model/provider, reset context, or choose another recovery path, then run /analyst-worker.";
+				}
+			} else {
+				consecutiveWorkerToolProtocolFailures = 0;
+				const workerFinal = (finalText || text).trim();
+				const incompleteWorkerReport = !workerReportLooksComplete(workerFinal) && !workerExplicitlyNeedsOperator(workerFinal);
+				if (incompleteWorkerReport && consecutiveIncompleteWorkerReports < 2) {
+					consecutiveIncompleteWorkerReports += 1;
+					stateAfter = "WORKER_RUNNING";
+					nextPhase = "WORKER_RUN";
+					nextRole = "WORKER";
+					autoNextPhase = "WORKER_RUN";
+					run.authorizedInstructionId = turn.authorizedInstructionId ?? run.authorizedInstructionId;
+					run.recoveryWorkerInstruction = incompleteWorkerContinuationInstruction(turn);
+					run.nextAction = "Worker turn ended without the required final report sections; automatically continuing the same bounded instruction to complete/report it.";
+					run.operatorExpected = "No: this is an automatic same-instruction completion recovery.";
+					reason = "worker ended without required final report; continuing same bounded instruction automatically";
+					expected = "No operator action needed. Worker will continue the same instruction and produce a complete report.";
+				} else {
+					consecutiveIncompleteWorkerReports = 0;
+					run.workerStepsSinceOperator = (run.workerStepsSinceOperator ?? 0) + 1;
+					run.lastCompletedWorkerInstructionId = turn.authorizedInstructionId;
+					run.lastCompletedWorkerStep = turn.step;
+					run.authorizedInstructionId = undefined;
+					run.recoveryWorkerInstruction = undefined;
+					stateAfter = "ANALYST_REVIEWING";
+					nextPhase = "ANALYST_REVIEW";
+					nextRole = "ANALYST";
+					autoNextPhase = "ANALYST_REVIEW";
+					run.nextAction = "Workflow is continuing automatically with analyst review of the worker result.";
+					run.operatorExpected = "No: analyst review will run automatically.";
+					reason = incompleteWorkerReport ? "worker report remained incomplete after automatic continuations; starting analyst review" : "worker stage finished; starting analyst review automatically";
+					expected = "No operator action needed. Analyst will review and either plan the next stage or ask for help.";
+				}
+			}
 		}
 
 		if (turn.phase === "ANALYST_REVIEW") {
@@ -2057,6 +2728,8 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 				stopDone();
 			} else if (next === "ABORT") {
 				stopAbort();
+			} else if (next === "NEEDS_OPERATOR" && shouldAutoReconcileFromAnalyst(text, run.lastCompletedWorkerInstructionId)) {
+				continueWithAutomaticReconciliation("analyst found contradictory/truncated evidence; starting safe read-only reconciliation audit automatically");
 			} else if (next === "NEEDS_OPERATOR") {
 				stopNeedsOperator();
 			} else if (shouldStopForAutonomousRuntime(run)) {
@@ -2083,7 +2756,7 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		if (turn.role === "ANALYST") run.lastAnalystReportPath = run.lastReportPath;
 		else run.lastWorkerReportPath = run.lastReportPath;
 		await saveRun(ctx);
-		await writeFile(reportAbs, stepReportMarkdown(turn, run, usage, stateAfter, transcript, timing), "utf8");
+		await writeFile(reportAbs, stepReportMarkdown(turn, run, usage, stateAfter, transcript, timing, finalText), "utf8");
 
 		const ledger = await readLedger(run);
 		const previous = ledger.totals[turn.model] ?? { in: 0, out: 0, cache_read: 0, cache_write: 0, cost: 0 };
@@ -2168,6 +2841,24 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		};
 	});
 
+	pi.on("context", (event) => {
+		if (!run || !activeTurn) return;
+		const result = sanitizeToolProtocolContext(event.messages as any[]);
+		if (result.removed > 0) {
+			activeTurn.contextSanitizedToolResults = (activeTurn.contextSanitizedToolResults ?? 0) + result.removed;
+		}
+		return result.removed > 0 ? { messages: result.messages } : undefined;
+	});
+
+	pi.on("before_provider_request", (event) => {
+		if (!run || !activeTurn) return;
+		const result = sanitizeProviderToolPayload(event.payload);
+		if (result.removed > 0) {
+			activeTurn.contextSanitizedToolResults = (activeTurn.contextSanitizedToolResults ?? 0) + result.removed;
+			return result.payload;
+		}
+	});
+
 	pi.on("message_update", (event: MessageUpdateEvent) => {
 		if (event.message.role !== "assistant") return;
 		sanitizeAssistantErrorInPlace(event.message);
@@ -2209,6 +2900,21 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (event, ctx) => {
 		await finishTurn(event, ctx);
+	});
+
+	pi.on("input", async (event, ctx) => {
+		if (!run || activeTurn || run.paused) return;
+		if (event.source === "extension" || event.streamingBehavior) return;
+		if (run.state !== "BLOCKED_NEEDS_OPERATOR" && run.state !== "WAITING_FOR_OPERATOR") return;
+		const text = event.text.trim();
+		if (!text || text.startsWith("/")) return;
+		await recordOperatorNote(ctx, text);
+		sendMessage(
+			`[OPERATOR RESPONSE]\n\n${text}\n\nRecorded in Analyst/Worker state and continuing with ${run.nextRole ?? "ANALYST"}.`,
+			{ type: "operator-note", text, autoContinue: true },
+		);
+		if (run.nextPhase) await startRoleTurn(ctx, run.nextPhase, false);
+		return { action: "handled" as const };
 	});
 
 	pi.on("model_select", (_event, ctx) => updateStatus(ctx));
@@ -2435,6 +3141,10 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 		const artifactDirInput = `./tmp/aw_${pathTimestamp()}_${slugify(taskTitle)}`;
 
 		sendMessage(`[SYSTEM]\nInitializing Analyst/Worker state files...`, { type: "progress" });
+		consecutiveWorkerToolProtocolFailures = 0;
+		consecutiveIncompleteWorkerReports = 0;
+		consecutiveCompactionFailures = 0;
+		forceExternalWorkerOnce = false;
 		run = createRun(ctx, {
 			taskTitle,
 			taskDescription,
@@ -2472,6 +3182,10 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			sendMessage(operatorMessage(run, "No next role phase is available", "Run /analyst-worker archive, /analyst-worker start <task>, or /analyst-worker abort."));
 			return;
 		}
+		consecutiveWorkerToolProtocolFailures = 0;
+		consecutiveIncompleteWorkerReports = 0;
+		consecutiveCompactionFailures = 0;
+		forceExternalWorkerOnce = false;
 		await startRoleTurn(ctx, run.nextPhase, false);
 	}
 
@@ -2634,13 +3348,12 @@ export default function analystWorkerExtension(pi: ExtensionAPI) {
 			return startWorkflow(trimmed, ctx, { autoPlan: true });
 		}
 
-		run.workerStepsSinceOperator = 0;
-		run.autonomousStartedAt = nowIso();
-		await saveRun(ctx);
+		await recordOperatorNote(ctx, trimmed);
 		sendMessage(
-			`[OPERATOR HANDOFF]\nState: ${run.state}\nReason: operator note recorded\nExpected operator input:\n  Run /analyst-worker to choose the next action. The next analyst turn will see this note.\n\nOperator note:\n${trimmed}`,
+			`[OPERATOR HANDOFF]\nState: ${run.state}\nReason: operator note recorded\nExpected operator input:\n  No extra step needed: Analyst/Worker is continuing now.\n\nOperator note:\n${trimmed}`,
 			{ type: "operator-note", text: trimmed },
 		);
+		if (run.nextPhase && !run.paused) await startRoleTurn(ctx, run.nextPhase, false);
 	}
 
 	const subcommands = [
